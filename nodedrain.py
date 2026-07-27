@@ -36,8 +36,14 @@ BATCH_NAMESPACES = {
     "fate-shared",
 }
 
-RACK_NODE_REGEX = re.compile(r"^(ahab\d{2})\d{2}$")
+RACK_NODE_REGEX = re.compile(r"^(ahab\d[0-9a-zA-Z])(\d{2})$")
 LABELS_TO_STRIP = {"pod-template-hash", "controller-revision-hash", "statefulset.kubernetes.io/pod-name"}
+
+# Only nodes numbered in this (inclusive) range are considered part of the
+# "rack" for cordon-check and migration purposes. Nodes 16-20 on any rack
+# are ES nodes and must be completely ignored by this script.
+RACK_NODE_NUM_MIN = 1
+RACK_NODE_NUM_MAX = 15
 
 DEFAULT_TIMEOUT = 600       # seconds to wait for a pod/group to come back Ready
 DEFAULT_POLL_INTERVAL = 10  # seconds between readiness polls
@@ -75,15 +81,32 @@ def get_rack_prefix(node_name):
     m = RACK_NODE_REGEX.match(node_name)
     if not m:
         print(f"[ERROR] Node name '{node_name}' does not match expected pattern "
-              f"'ahabRRNN' (e.g. ahab1101, ahab2215).")
+              f"'ahabRxNN' (e.g. ahab1101, ahab1a05, ahab2c15).")
         sys.exit(1)
-    return m.group(1)
+    rack_prefix, node_num = m.group(1), int(m.group(2))
+    if not (RACK_NODE_NUM_MIN <= node_num <= RACK_NODE_NUM_MAX):
+        print(f"[ERROR] Node '{node_name}' has node-number {node_num:02d}, which is outside "
+              f"the k8s node range {RACK_NODE_NUM_MIN:02d}-{RACK_NODE_NUM_MAX:02d}. "
+              f"Nodes 16-20 are ES nodes and are out of scope for this script.")
+        sys.exit(1)
+    return rack_prefix
 
 
 def get_rack_nodes(rack_prefix):
+    """Return only the nodes on this rack numbered within RACK_NODE_NUM_MIN..MAX.
+    Nodes 16-20 (ES nodes) are deliberately excluded and never inspected or touched."""
     data = run_kubectl_json(["get", "nodes"])
-    pattern = re.compile(rf"^{re.escape(rack_prefix)}\d{{2}}$")
-    return [n["metadata"]["name"] for n in data["items"] if pattern.match(n["metadata"]["name"])]
+    pattern = re.compile(rf"^{re.escape(rack_prefix)}(\d{{2}})$")
+    rack_nodes = []
+    for n in data["items"]:
+        name = n["metadata"]["name"]
+        m = pattern.match(name)
+        if not m:
+            continue
+        node_num = int(m.group(1))
+        if RACK_NODE_NUM_MIN <= node_num <= RACK_NODE_NUM_MAX:
+            rack_nodes.append(name)
+    return rack_nodes
 
 
 def get_node_cordon_status(node_name):
