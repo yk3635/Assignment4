@@ -1,275 +1,283 @@
-# Anthropic NGINX — Operations Troubleshooting Runbook
+# Anthropic NGINX — On-Call Troubleshooting Runbook (BAU)
 
 **Project:** `anthropic-nginx` (AI endpoint proxy)
-**Companion doc:** `anthropic-nginx-deployment-runbook.md` (deployment/CI issues live there — Section 9)
-**Scope:** Runtime/operational issues with the container once deployed — not deployment
-pipeline failures.
-**Last updated:** 2026-07-23
+**Companion doc:** `anthropic-nginx-deployment-runbook.md` — use that instead if the
+issue started right after a deploy/config push, or involves Ansible/git.
+**Audience:** On-call engineer responding to an alert or a "the AI endpoint is down/slow"
+report.
+**Last updated:** 2026-07-26
 
 ---
 
-## How to use this doc
+## 0. First 2 minutes — fast triage
 
-Find the symptom closest to what you're seeing, confirm the diagnosis with the given
-command(s), then apply the fix.
+Run this block first, every time. It tells you which of the four scenarios below
+you're in.
+
+```bash
+# 1. Is the container even up?
+sudo docker inspect anthropic-nginx --format 'Status={{.State.Status}} StartedAt={{.State.StartedAt}}'
+
+# 2. Is nginx config valid right now?
+sudo docker exec anthropic-nginx nginx -t
+
+# 3. Is the endpoint reachable at all?
+curl -sk -o /dev/null -w "HTTP %{http_code} | total %{time_total}s\n" \
+  https://localhost:8783/anthropic/api/v1/messages?beta=true
+
+# 4. Any errors in the last 5 minutes?
+sudo docker logs anthropic-nginx --since 5m 2>&1 | grep -i error
+```
+
+| Result | Go to |
+|---|---|
+| Container not `running` / restarting in a loop | [Scenario A](#scenario-a-container-down-or-crash-looping) |
+| Container running, but `curl` times out / connection refused | [Scenario B](#scenario-b-endpoint-unreachable-connection-refusedtimeout) |
+| Container running, `curl` returns 5xx | [Scenario C](#scenario-c-5xx-errors) |
+| Container running, `curl` succeeds but is slow, or errors mention resolver/buffering | [Scenario D](#scenario-d-slow-responses--intermittent-errors) |
+| Everything above looks fine but a user still reports an issue | [Scenario E](#scenario-e-everything-looks-healthy-but-user-reports-an-issue) |
 
 ---
 
-## 1. Container behavior issues
+## Scenario A: Container down or crash-looping
 
-### 1.1 `Conflict. The container name "/anthropic-nginx" is already in use`
-
-**Symptom:** Starting the container fails with a naming conflict.
-
-**Cause:** `start-anthropic.sh` does a plain `docker run`, with no stop/remove step.
-Running it against an already-running (or stopped-but-not-removed) container of the
-same name always fails this way — it's not idempotent by design.
-
-**Diagnosis:**
 ```bash
 sudo docker ps -a | grep anthropic-nginx
+sudo docker logs anthropic-nginx --tail 100
 ```
-Confirm whether a stopped (not removed) container is holding the name — `docker rm`
-is required, not just `docker stop`, to free the name for a new `docker run`.
 
-**Fix:**
+**If `Status=exited`:**
+- Check the exit reason and last log lines above — usually a config error on
+  startup (`nginx -t`-equivalent failure baked into `docker run`) or a missing
+  mounted file.
+- Try to start it manually and watch the failure live:
+  ```bash
+  sudo docker start anthropic-nginx && sudo docker logs -f anthropic-nginx
+  ```
+
+**If `Status=running` but flapping (StartedAt keeps changing on repeat checks):**
+- `--restart always` will keep relaunching a crashing container — check logs for
+  the crash reason (segfault, OOM kill, config error) rather than assuming it'll
+  self-heal:
+  ```bash
+  sudo docker inspect anthropic-nginx --format '{{.State.OOMKilled}}'
+  dmesg -T | grep -i "out of memory" | tail -5
+  ```
+
+**If the container name is stuck in a bad state (won't start, "already in use", etc.):**
 ```bash
-sudo docker stop anthropic-nginx && sudo docker rm anthropic-nginx
+sudo docker stop anthropic-nginx 2>/dev/null
+sudo docker rm anthropic-nginx 2>/dev/null
 sudo /opt/deploy/anthropic/scripts/start-anthropic.sh
 ```
 
----
-
-### 1.2 Container running but serving stale config/image
-
-**Symptom:** Behavior (headers, upstream, cert) looks like an old version, despite a
-deploy having run.
-
-**Diagnosis:**
-```bash
-sudo docker inspect anthropic-nginx --format '{{.Config.Image}}'
-sudo docker inspect anthropic-nginx --format '{{.State.StartedAt}}'
-diff /opt/deploy/anthropic/configs/nginx.conf <(sudo docker exec anthropic-nginx cat /etc/nginx/nginx.conf)
-```
-
-**Likely causes:**
-1. Container wasn't restarted after new config/image was staged
-2. Image tag wasn't actually changed, so the image-presence check skipped the pull
-   (see 1.3 below)
-3. Templated file diff shows a mismatch — wrong source template or stale variable
+**Escalate if:** the container keeps crashing after a clean manual start with no
+config changes made — this points to an image or environment problem beyond
+config, not something to keep retrying solo.
 
 ---
 
-### 1.3 Image not being re-pulled despite expecting a refresh
+## Scenario B: Endpoint unreachable (connection refused/timeout)
 
-**Symptom:** You expect a new image, but the container is still running the old one.
+Container is running, but requests don't get a response.
 
-**Cause:** The deploy pipeline checks the target host for `<image>:<tag>` already
-present, and skips the pull if a match is found — this is intentional idempotent
-behavior, not a bug, but it means a *floating* tag (e.g. `stable-alpine`) that gets
-rebuilt upstream with new content will not automatically trigger a fresh pull.
-
-**Diagnosis:**
 ```bash
-sudo docker image ls --format '{{.Repository}}:{{.Tag}}' | grep <anthropic_img>:<anthropic_version>
-```
-If this returns a match on the target host, that's why a pull was skipped.
+# Is nginx actually bound to the port?
+sudo ss -tlnp | grep :8783
 
-**Fix (force a repull of the same tag):**
-```bash
-sudo docker rmi <anthropic_img>:<anthropic_version>
+# Anything else on the host holding the port (network host mode risk)?
+sudo lsof -i :8783
 ```
-Then redeploy. Longer-term: prefer immutable, unique tags per build to avoid this
-ambiguity entirely.
+
+**If nothing is listening on the port:**
+- nginx likely failed to bind at startup — check `docker logs anthropic-nginx` for
+  a bind error (`Address already in use`, or a startup config failure).
+- Confirm no other process/container grabbed the port first — remember this
+  container runs `--network host`, so it shares the host's port space directly.
+
+**If something IS listening but connections still refuse/timeout:**
+- Check host-level firewall/iptables rules haven't changed:
+  ```bash
+  sudo iptables -L -n | grep 8783
+  ```
+- Check from a *different* host/network segment, not just localhost — this
+  isolates "nginx is broken" from "network path to this node is broken":
+  ```bash
+  curl -sk -o /dev/null -w "HTTP %{http_code}\n" https://<node-fqdn>:8783/...
+  ```
+  If localhost works but remote doesn't, this is a network/firewall/routing issue,
+  not an nginx issue — escalate to network team.
+
+**Escalate if:** port is bound, firewall looks clean, and it's still unreachable
+from elsewhere — likely upstream network path issue outside this node.
 
 ---
 
-### 1.4 `nginx -t` fails inside the container
+## Scenario C: 5xx errors
 
-**Diagnosis:**
 ```bash
+sudo docker logs anthropic-nginx --tail 200 | grep -E "50[0-9]|error"
 sudo docker exec anthropic-nginx nginx -t
 ```
 
-**Common causes:**
-- A bind-mounted file referenced in `nginx.conf` doesn't exist at the expected path
-  on the host — check mounts vs. what `nginx.conf` expects:
+**502 Bad Gateway** — nginx can't reach the upstream (the actual AI service behind
+this proxy).
+```bash
+# Confirm what upstream nginx is configured to hit
+sudo docker exec anthropic-nginx grep -A3 "proxy_pass\|upstream" /etc/nginx/nginx.conf
+
+# Test reachability to that upstream directly from this host
+curl -sk -o /dev/null -w "HTTP %{http_code}\n" <upstream-url>
+```
+If the upstream itself is down/unreachable, this is not an nginx-proxy problem —
+escalate to whoever owns the upstream AI service.
+
+**504 Gateway Timeout** — upstream is reachable but too slow to respond within
+nginx's configured timeout.
+```bash
+sudo docker exec anthropic-nginx grep -i "proxy_read_timeout\|proxy_connect_timeout\|proxy_send_timeout" /etc/nginx/nginx.conf
+```
+Confirm whether the upstream is genuinely slow (its own problem) vs. the timeout
+being too aggressive for legitimately long AI response times (large context /
+long generations can take a while — this proxy may need a longer read timeout
+than a typical web service).
+
+**"send() failed (111: Connection refused) while resolving, resolver: ..."**
+- This is a **DNS resolution failure inside nginx**, not an upstream outage.
+- Confirm the configured `resolver` in `nginx.conf` is a real, working DNS server
+  for this host — a mismatched resolver IP (e.g. `127.0.0.53` when this host
+  doesn't run a local DNS stub) will cause every dynamic-hostname upstream lookup
+  to fail instantly:
   ```bash
-  sudo docker inspect anthropic-nginx --format '{{json .Mounts}}' | python3 -m json.tool
+  sudo docker exec anthropic-nginx grep resolver /etc/nginx/nginx.conf
+  cat /etc/resolv.conf   # compare against what nginx.conf has configured
   ```
-- A templated variable rendered incorrectly (empty upstream, malformed directive) —
-  inspect the rendered file directly:
+- If they don't match, this is a config bug — fix in `nginx.conf.j2` per the
+  deployment runbook and redeploy; it will not self-resolve by retrying.
+
+**503 Service Unavailable**
+- Check if this is nginx itself refusing (rate limiting / connection limits
+  configured) vs. the upstream returning a 503 that's being passed through:
   ```bash
-  cat /opt/deploy/anthropic/configs/nginx.conf
+  sudo docker logs anthropic-nginx --tail 100 | grep 503
   ```
-- Cert/key/dhparam files missing or unreadable at the mounted paths:
-  ```bash
-  sudo docker exec anthropic-nginx ls -la /etc/nginx/certs/
-  ```
+
+**Escalate if:** the upstream AI service itself is confirmed down/erroring — that's
+outside this proxy's control, hand off to the upstream service owner with the
+timestamp and error pattern.
 
 ---
 
-### 1.5 Container up but endpoint not responding
+## Scenario D: Slow responses / intermittent errors
 
-**Diagnosis:**
+**Check for request body buffering to disk (common on large AI payloads):**
 ```bash
-sudo docker inspect anthropic-nginx --format '{{.State.Status}}'
-sudo docker logs anthropic-nginx --tail 100
-curl -sk https://localhost/<ai-endpoint-path> -o /dev/null -w "%{http_code}\n"
+sudo docker logs anthropic-nginx --since 30m 2>&1 | grep -c "buffered to a temporary file"
 ```
+A high count on the `v1/messages` endpoint is expected behavior for large
+request bodies, not necessarily a bug — but if it's happening on nearly every
+request, disk I/O is adding latency. Check disk health on the temp path:
+```bash
+sudo docker exec anthropic-nginx df -h /var/cache/nginx/client_temp
+```
+If this is a chronic pattern (not a one-off during an incident), it's a tuning
+item for the deployment runbook (`client_body_buffer_size`), not something to
+fix live during an on-call incident — note it and move on unless disk is actually
+full/slow.
 
-**Common causes:**
-- Nginx running but proxy_pass/upstream misconfigured (check rendered `nginx.conf`)
-- Cert mismatch or expired cert (check `openssl x509 -in <cert> -noout -dates`)
-- `--network host` mode means the container binds directly to host ports — confirm
-  nothing else on the host (another process, a leftover container) already holds
-  the port:
-  ```bash
-  sudo ss -tlnp | grep :443
-  ```
+**Check for intermittent DNS resolution flakiness (if upstream is a hostname, not IP):**
+```bash
+sudo docker logs anthropic-nginx --since 30m 2>&1 | grep -i "resolv"
+```
+Intermittent (not constant) resolver errors can indicate a flaky/overloaded DNS
+server rather than a fully broken config — check DNS server health if this
+correlates with wider DNS complaints elsewhere in the environment.
+
+**Check host-level resource pressure:**
+```bash
+sudo docker stats anthropic-nginx --no-stream
+top -bn1 | head -20
+```
+High CPU/memory on the container or host can manifest as slowness before it
+manifests as outright errors.
+
+**Escalate if:** resource pressure is confirmed and isn't something you can
+relieve (e.g. host is genuinely undersized for current load) — this needs a
+capacity conversation, not a live fix.
 
 ---
 
-## 2. Logging issues
+## Scenario E: Everything looks healthy, but user reports an issue
 
-### 2.1 Single log file growing unbounded
+This is the most common false-alarm-vs-real-issue ambiguity. Narrow it down:
 
-**Symptom:** A single, ever-growing log file, not obviously tied to `/var/log/nginx`
-paths you'd expect.
+1. **Get the exact request** from the user — endpoint, method, timestamp, any
+   error message/status code they saw client-side.
+2. **Search logs for that exact window:**
+   ```bash
+   sudo docker exec anthropic-nginx grep "<timestamp-fragment>" /var/log/nginx/access.log
+   sudo docker exec anthropic-nginx grep "<timestamp-fragment>" /var/log/nginx/error.log
+   ```
+3. **Reproduce with the same request shape** if possible (same endpoint, similar
+   payload size) — a single large/malformed request can trigger an isolated
+   413/400 without any broader outage.
+4. **Check if the user is hitting this node specifically**, or if there's a
+   GSLB/load-balancer routing them somewhere else intermittently — a resolver or
+   DNS issue upstream of this node (client-side, not this proxy's own resolver)
+   can look identical to a server-side problem from the user's perspective.
 
-**Diagnosis — determine which case you're in:**
-```bash
-sudo docker exec anthropic-nginx ls -la /var/log/nginx/
-```
-
-- **If `access.log`/`error.log` are symlinks** (`-> /dev/stdout` / `-> /dev/stderr`):
-  Docker's `json-file` log driver is capturing everything into
-  `/var/lib/docker/containers/<id>/<id>-json.log` with no size cap by default.
-  ```bash
-  sudo docker inspect anthropic-nginx --format '{{.LogPath}}'
-  ```
-  This should not occur in the current setup (logs are bind-mounted to real files),
-  but if it does, the container was likely started without the log mount — check
-  `start-anthropic.sh` was actually used and the mount is present (Section 2.2 below).
-
-- **If they're real files:** growth is from `logrotate` not running or misconfigured
-  — see 2.3 and 2.4.
+**Escalate if:** logs show nothing for the reported time window at all — this
+usually means the request never reached this node, pointing to a routing/DNS
+issue upstream of this proxy rather than anything on this host.
 
 ---
 
-### 2.2 Confirming the log bind-mount is active
+## Quick reference — commands used throughout
 
 ```bash
-sudo docker inspect anthropic-nginx --format '{{json .Mounts}}' | python3 -m json.tool
-```
-Confirm an entry mounting `/data/anthropic_nginx/logs` (host) → `/var/log/nginx`
-(container). If it's missing, the container was started from an outdated script
-version — redeploy the current `start-anthropic.sh` and restart the container
-(see deployment runbook).
-
----
-
-### 2.3 Logs not rotating on schedule
-
-**Diagnosis:**
-```bash
-cat /etc/logrotate.d/anthropic-nginx
-sudo logrotate -d /etc/logrotate.d/anthropic-nginx   # dry run, verbose
-ls -lrt /data/anthropic_nginx/logs/
-```
-
-**Common causes:**
-- **Wrong path in the logrotate config** — confirm the glob
-  (`/data/anthropic_nginx/logs/*.log`) actually matches where logs live. A stray or
-  older config pointing at a different path (e.g. `/data/nginx/logs/*.log`) will
-  silently rotate nothing at the path you expect while reporting success elsewhere.
-- **Host cron/timer not running:**
-  ```bash
-  cat /etc/cron.daily/logrotate 2>/dev/null || sudo systemctl list-timers | grep logrotate
-  ```
-- **"Log does not need rotating" on manual test** — expected if logrotate's state
-  file (`/var/lib/logrotate/logrotate.status`) shows it already rotated today.
-  `daily` means "at most once per day," not "every time you run it." Force it:
-  ```bash
-  sudo logrotate -f /etc/logrotate.d/anthropic-nginx
-  ```
-
----
-
-### 2.4 Permission errors writing to mounted log directory after rotation
-
-**Symptom:** nginx errors appear in `docker logs anthropic-nginx` after a rotation,
-or the log file stops growing post-rotation.
-
-**Cause:** `copytruncate` truncates the file in place, so the file keeps its
-original ownership — but if the *directory* or newly created files end up with
-different ownership (e.g. root vs. the nginx container's runtime UID), nginx may
-lose write access.
-
-**Diagnosis:**
-```bash
-sudo docker exec anthropic-nginx id nginx
-ls -la /data/anthropic_nginx/logs/
-```
-
-**Fix:**
-```bash
-sudo chown -R <uid>:<gid> /data/anthropic_nginx/logs
-```
-
----
-
-### 2.5 Confirming rotation is truly working end-to-end
-
-```bash
-# Force a rotation
-sudo logrotate -f /etc/logrotate.d/anthropic-nginx
-
-# Confirm rotated + compressed files appear
-ls -lrt /data/anthropic_nginx/logs/
-# Expect: access.log, access.log.1.gz, error.log, error.log.1.gz, ...
-
-# Confirm nginx is still writing to the active (post-truncate) file
-sudo docker exec anthropic-nginx sh -c 'echo test >> /var/log/nginx/error.log'
-tail -1 /data/anthropic_nginx/logs/error.log
-```
-
----
-
-## 3. General diagnostic commands (quick reference)
-
-```bash
-# Container state
-sudo docker inspect anthropic-nginx --format '{{.State.Status}}'
-sudo docker inspect anthropic-nginx --format '{{.State.StartedAt}}'
-sudo docker inspect anthropic-nginx --format '{{.Config.Image}}'
-sudo docker inspect anthropic-nginx --format '{{json .Mounts}}' | python3 -m json.tool
-sudo docker inspect anthropic-nginx --format '{{json .HostConfig.LogConfig}}'
-
-# Config validation
+# Health snapshot
+sudo docker inspect anthropic-nginx --format 'Status={{.State.Status}} StartedAt={{.State.StartedAt}}'
 sudo docker exec anthropic-nginx nginx -t
-
-# Recent errors
 sudo docker logs anthropic-nginx --tail 100
 
-# Port binding check (network host mode)
-sudo ss -tlnp | grep :443
+# Port / network
+sudo ss -tlnp | grep :8783
+sudo lsof -i :8783
+sudo iptables -L -n | grep 8783
 
-# Logrotate state/debug
-cat /var/lib/logrotate/logrotate.status
-sudo logrotate -d /etc/logrotate.d/anthropic-nginx
+# Logs, scoped to a time window
+sudo docker logs anthropic-nginx --since 30m
+sudo docker exec anthropic-nginx grep "<pattern>" /var/log/nginx/access.log
+sudo docker exec anthropic-nginx grep "<pattern>" /var/log/nginx/error.log
+
+# Resource check
+sudo docker stats anthropic-nginx --no-stream
+
+# Functional test
+curl -sk -o /dev/null -w "HTTP %{http_code} | total %{time_total}s\n" \
+  https://localhost:8783/anthropic/api/v1/messages?beta=true
 ```
 
 ---
 
-## 4. Escalation notes
+## When to hand off to the deployment runbook instead
 
-If none of the above resolves the issue:
+If any of the following are true, stop here and use
+`anthropic-nginx-deployment-runbook.md` instead:
+- A deploy/config push happened shortly before the issue started
+- You need to actually change `nginx.conf`, the start script, or any templated file
+- The fix requires running the Ansible playbook
+- The issue is a `git push` / GitLab merge problem, not a running-system problem
 
-1. Capture `sudo docker logs anthropic-nginx --tail 200`
-2. Capture `sudo docker inspect anthropic-nginx` (full, not just formatted fields)
-3. Note the exact `anthropic_version` and target hostname involved
-4. Check whether the issue correlates with a recent deploy — if so, cross-reference
-   the deployment runbook's troubleshooting section (Section 9) as well
+---
+
+## Escalation
+
+If triage above doesn't resolve it or points outside this node's control:
+
+1. Capture the Section 0 fast-triage output in full
+2. Capture `sudo docker logs anthropic-nginx --since 1h`
+3. Note exact timestamps, endpoint(s), and client IP(s) involved
+4. Note whether this correlates with a recent deploy (check with the deploy owner)
 
 _Add team escalation contact / on-call channel here._
