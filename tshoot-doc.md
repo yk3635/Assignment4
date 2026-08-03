@@ -11,6 +11,10 @@ report.
 
 ## 0. First 2 minutes — fast triage
 
+> This section assumes nginx listens on `443` directly (standard TLS termination
+> under `--network host`). Confirm this once and correct below if different:
+> `sudo docker exec anthropic-nginx grep -i listen /etc/nginx/nginx.conf`
+
 Run this block first, every time. It tells you which of the four scenarios below
 you're in.
 
@@ -21,25 +25,49 @@ sudo docker inspect anthropic-nginx --format 'Status={{.State.Status}} StartedAt
 # 2. Is nginx config valid right now?
 sudo docker exec anthropic-nginx nginx -t
 
-# 3. Is the endpoint reachable at all?
-curl -sk -o /dev/null -w "HTTP %{http_code} | total %{time_total}s\n" \
+# 3. Is the endpoint reachable? Test BOTH direct-to-nginx and through HAProxy —
+#    the comparison tells you which layer is at fault if one fails and the other doesn't.
+#    Confirm nginx's actual listen port first if unsure:
+#    sudo docker exec anthropic-nginx grep -i listen /etc/nginx/nginx.conf
+
+# Direct to nginx (bypasses HAProxy) — isolates nginx/upstream from HAProxy
+curl -sk -o /dev/null -w "[nginx direct :443]  HTTP %{http_code} | total %{time_total}s\n" \
+  https://localhost:443/anthropic/api/v1/messages?beta=true
+
+# Through HAProxy frontend — tests the full client-facing path
+curl -sk -o /dev/null -w "[via HAProxy :8783] HTTP %{http_code} | total %{time_total}s\n" \
   https://localhost:8783/anthropic/api/v1/messages?beta=true
 
-# 4. Any errors in the last 5 minutes?
-sudo docker logs anthropic-nginx --since 5m 2>&1 | grep -i error
+# 4. Any recent errors?
+#    (nginx logs to real files, bind-mounted to the host — NOT captured by `docker logs`)
+sudo tail -100 /data/nginx/logs/error.log
 ```
+
+**Reading the :443 vs :8783 comparison:**
+- Both succeed → this endpoint is healthy end-to-end
+- `:443` works, `:8783` fails → problem is in HAProxy or its routing to this node,
+  not this nginx container — hand off to the HAProxy owner, no need to keep
+  digging into nginx
+- Both fail → problem is likely in nginx itself or the upstream AI service,
+  continue with the scenarios below
 
 | Result | Go to |
 |---|---|
 | Container not `running` / restarting in a loop | [Scenario A](#scenario-a-container-down-or-crash-looping) |
-| Container running, but `curl` times out / connection refused | [Scenario B](#scenario-b-endpoint-unreachable-connection-refusedtimeout) |
-| Container running, `curl` returns 5xx | [Scenario C](#scenario-c-5xx-errors) |
-| Container running, `curl` succeeds but is slow, or errors mention resolver/buffering | [Scenario D](#scenario-d-slow-responses--intermittent-errors) |
+| `:443` fails too (not just `:8783`) — times out / connection refused | [Scenario B](#scenario-b-endpoint-unreachable-connection-refusedtimeout) |
+| `:443` returns 5xx | [Scenario C](#scenario-c-5xx-errors) |
+| `:443` succeeds but is slow, or errors mention resolver/buffering | [Scenario D](#scenario-d-slow-responses--intermittent-errors) |
+| `:443` works, `:8783` fails | Not this container — hand off to HAProxy owner |
 | Everything above looks fine but a user still reports an issue | [Scenario E](#scenario-e-everything-looks-healthy-but-user-reports-an-issue) |
 
 ---
 
 ## Scenario A: Container down or crash-looping
+
+> Note: this is the one scenario where `docker logs` is still the right tool — a
+> container that's crashing or failing to bind fails *before* nginx reaches its own
+> log files, so `docker logs` (stdout/stderr) is the only place that startup failure
+> shows up. Everywhere else in this doc, use the files under `/data/nginx/logs/`.
 
 ```bash
 sudo docker ps -a | grep anthropic-nginx
@@ -79,14 +107,16 @@ config, not something to keep retrying solo.
 
 ## Scenario B: Endpoint unreachable (connection refused/timeout)
 
-Container is running, but requests don't get a response.
+Container is running, but requests don't get a response — this scenario applies
+when the **direct-to-nginx `:443` test already failed** (if only `:8783` failed,
+this isn't nginx, see the fast-triage table above).
 
 ```bash
-# Is nginx actually bound to the port?
-sudo ss -tlnp | grep :8783
+# Is nginx actually bound to its port?
+sudo ss -tlnp | grep :443
 
 # Anything else on the host holding the port (network host mode risk)?
-sudo lsof -i :8783
+sudo lsof -i :443
 ```
 
 **If nothing is listening on the port:**
@@ -98,12 +128,12 @@ sudo lsof -i :8783
 **If something IS listening but connections still refuse/timeout:**
 - Check host-level firewall/iptables rules haven't changed:
   ```bash
-  sudo iptables -L -n | grep 8783
+  sudo iptables -L -n | grep 443
   ```
 - Check from a *different* host/network segment, not just localhost — this
   isolates "nginx is broken" from "network path to this node is broken":
   ```bash
-  curl -sk -o /dev/null -w "HTTP %{http_code}\n" https://<node-fqdn>:8783/...
+  curl -sk -o /dev/null -w "HTTP %{http_code}\n" https://<node-fqdn>:443/...
   ```
   If localhost works but remote doesn't, this is a network/firewall/routing issue,
   not an nginx issue — escalate to network team.
@@ -116,7 +146,8 @@ from elsewhere — likely upstream network path issue outside this node.
 ## Scenario C: 5xx errors
 
 ```bash
-sudo docker logs anthropic-nginx --tail 200 | grep -E "50[0-9]|error"
+sudo tail -200 /data/nginx/logs/error.log | grep -iE "50[0-9]|error"
+sudo grep -E ' 50[0-9] ' /data/nginx/logs/access.log | tail -50
 sudo docker exec anthropic-nginx nginx -t
 ```
 
@@ -159,7 +190,7 @@ than a typical web service).
 - Check if this is nginx itself refusing (rate limiting / connection limits
   configured) vs. the upstream returning a 503 that's being passed through:
   ```bash
-  sudo docker logs anthropic-nginx --tail 100 | grep 503
+  sudo grep ' 503 ' /data/nginx/logs/access.log | tail -50
   ```
 
 **Escalate if:** the upstream AI service itself is confirmed down/erroring — that's
@@ -172,8 +203,10 @@ timestamp and error pattern.
 
 **Check for request body buffering to disk (common on large AI payloads):**
 ```bash
-sudo docker logs anthropic-nginx --since 30m 2>&1 | grep -c "buffered to a temporary file"
+sudo grep -c "buffered to a temporary file" /data/nginx/logs/error.log
 ```
+(For a time-bounded count rather than the whole file, pair with `tail`/timestamp
+filtering, or check `find /data/nginx/logs -newermt '30 min ago'` for rotation timing.)
 A high count on the `v1/messages` endpoint is expected behavior for large
 request bodies, not necessarily a bug — but if it's happening on nearly every
 request, disk I/O is adding latency. Check disk health on the temp path:
@@ -187,7 +220,7 @@ full/slow.
 
 **Check for intermittent DNS resolution flakiness (if upstream is a hostname, not IP):**
 ```bash
-sudo docker logs anthropic-nginx --since 30m 2>&1 | grep -i "resolv"
+sudo grep -i "resolv" /data/nginx/logs/error.log | tail -50
 ```
 Intermittent (not constant) resolver errors can indicate a flaky/overloaded DNS
 server rather than a fully broken config — check DNS server health if this
@@ -238,23 +271,27 @@ issue upstream of this proxy rather than anything on this host.
 # Health snapshot
 sudo docker inspect anthropic-nginx --format 'Status={{.State.Status}} StartedAt={{.State.StartedAt}}'
 sudo docker exec anthropic-nginx nginx -t
-sudo docker logs anthropic-nginx --tail 100
+sudo docker logs anthropic-nginx --tail 100   # container-level only: crash/startup/bind failures
 
-# Port / network
-sudo ss -tlnp | grep :8783
-sudo lsof -i :8783
-sudo iptables -L -n | grep 8783
+# Port / network — nginx binds :443 directly (host networking); HAProxy fronts on :8783
+sudo ss -tlnp | grep -E ':443|:8783'
+sudo lsof -i :443
+sudo iptables -L -n | grep -E '443|8783'
 
-# Logs, scoped to a time window
-sudo docker logs anthropic-nginx --since 30m
-sudo docker exec anthropic-nginx grep "<pattern>" /var/log/nginx/access.log
-sudo docker exec anthropic-nginx grep "<pattern>" /var/log/nginx/error.log
+# App logs — these live on the HOST at /data/nginx/logs (bind-mounted), NOT in
+# `docker logs`, since nginx writes real files here rather than stdout/stderr
+sudo tail -100 /data/nginx/logs/access.log
+sudo tail -100 /data/nginx/logs/error.log
+sudo grep "<pattern>" /data/nginx/logs/access.log
+sudo grep "<pattern>" /data/nginx/logs/error.log
 
 # Resource check
 sudo docker stats anthropic-nginx --no-stream
 
-# Functional test
-curl -sk -o /dev/null -w "HTTP %{http_code} | total %{time_total}s\n" \
+# Functional test — direct to nginx vs. through HAProxy
+curl -sk -o /dev/null -w "[nginx :443]  HTTP %{http_code} | %{time_total}s\n" \
+  https://localhost:443/anthropic/api/v1/messages?beta=true
+curl -sk -o /dev/null -w "[HAProxy :8783] HTTP %{http_code} | %{time_total}s\n" \
   https://localhost:8783/anthropic/api/v1/messages?beta=true
 ```
 
@@ -276,7 +313,9 @@ If any of the following are true, stop here and use
 If triage above doesn't resolve it or points outside this node's control:
 
 1. Capture the Section 0 fast-triage output in full
-2. Capture `sudo docker logs anthropic-nginx --since 1h`
+2. Capture both log sources:
+   - `sudo docker logs anthropic-nginx --since 1h` (container-level: crash/startup only)
+   - `sudo tail -500 /data/nginx/logs/error.log` and `access.log` (actual nginx activity)
 3. Note exact timestamps, endpoint(s), and client IP(s) involved
 4. Note whether this correlates with a recent deploy (check with the deploy owner)
 
