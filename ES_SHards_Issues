@@ -1,0 +1,55 @@
+# Get the exact reason for one shard
+curl -s -XGET "localhost:9200/_cluster/allocation/explain" -H 'Content-Type: application/json' -d '{
+  "index": ".ds-active-externalauditd_sess-ds-2026.08.02-003244",
+  "shard": 26,
+  "primary": false
+}' | jq .
+
+# Check if allocation is disabled cluster-wide
+curl -s -XGET "localhost:9200/_cluster/settings?include_defaults=true&filter_path=*.cluster.routing.allocation.enable"
+
+# Check index-level override
+curl -s -XGET "localhost:9200/.ds-active-externalauditd_sess-ds-2026.08.02-003244/_settings?filter_path=*.settings.index.routing"
+
+
+Step 1 — Explain each shard first:
+
+for idx_shard in \
+  ".ds-active-externalauditd_sess-ds-2026.08.02-003244:26" \
+  ".ds-active-externalgcp_audit_activity-ds-2026.07.11-000004:28" \
+  ".ds-active-externalpowershell_scriptblock-ds-2026.08.02-001004:93" \
+  ".ds-active-externalcloudtrail-ds-2026.08.02-000093:15"
+do
+  idx="${idx_shard%%:*}"
+  shard="${idx_shard##*:}"
+  echo "=== $idx shard $shard ==="
+  curl -s -XGET "localhost:9200/_cluster/allocation/explain" -H 'Content-Type: application/json' -d "{
+    \"index\": \"$idx\",
+    \"shard\": $shard,
+    \"primary\": false
+  }" | jq '.unassigned_info, .allocate_explanation, .node_allocation_decisions[]?.deciders[]? | select(.decision==\"NO\")'
+  echo
+done
+
+
+Step 2 — If it's the retry-exhaustion case (most likely given the naming), just retry the failed allocations — no manual targeting needed:
+
+
+curl -s -XPOST "localhost:9200/_cluster/reroute?retry_failed=true" | jq .
+
+
+Step 3 — Only if retry_failed doesn't work, force it explicitly:
+
+bash
+curl -s -XPOST "localhost:9200/_cluster/reroute" -H 'Content-Type: application/json' -d '{
+  "commands": [
+    {
+      "allocate_replica": {
+        "index": ".ds-active-externalauditd_sess-ds-2026.08.02-003244",
+        "shard": 26,
+        "node": "<target_node_name>"
+      }
+    }
+  ]
+}'
+
