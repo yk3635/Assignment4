@@ -112,3 +112,119 @@ kubectl get pod prometheus-server-6cf788db4b-cl2hv -n prometheus -o jsonpath='{.
 kubectl describe node ahab1205 | grep -A5 "Allocated resources"
 kubectl top node ahab1205
 
+Step 1 — Confirm current state
+bash
+kubectl get pod -n prometheus -l app=prometheus-server -o wide
+kubectl get pod -n prometheus -l app=prometheus-server -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}'
+
+Note the pod name and restart count — you'll compare against this after the fix.
+
+Step 2 — Check the actual data-loss window (so you know what you're accepting)
+bash
+POD=<current-pod-name>
+kubectl exec -it $POD -n prometheus -- sh -c 'ls -la /bitnami/prometheus/data/wal | head -5; ls -la /bitnami/prometheus/data/wal | tail -5'
+kubectl exec -it $POD -n prometheus -- sh -c 'ls -lt /bitnami/prometheus/data | grep -v wal | head -5'
+
+This tells you the WAL segment date range and the timestamp of the most recent successfully persisted block — that gap is what you'll lose. Sanity-check it's acceptable before continuing.
+
+Step 3 — Scale Prometheus down to zero
+
+Stops the crash loop and lets you safely touch the PVC without a live process fighting you.
+
+bash
+# Confirm whether it's a Deployment or StatefulSet first:
+kubectl get deploy,sts -n prometheus | grep prometheus
+
+# Then scale down (use whichever applies):
+kubectl scale deployment prometheus-server -n prometheus --replicas=0
+# or
+kubectl scale statefulset prometheus-server -n prometheus --replicas=0
+
+Wait for the pod to fully terminate:
+
+bash
+kubectl get pod -n prometheus -l app=prometheus-server -w
+Step 4 — Launch a temporary debug pod with the same PVC mounted
+
+Don't try to exec into a terminated pod — spin up a throwaway pod that mounts the same prometheus-server PVC so you can clear the WAL directly.
+
+yaml
+# debug-pvc-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: prometheus-wal-cleanup
+  namespace: prometheus
+spec:
+  containers:
+  - name: cleanup
+    image: busybox
+    command: ["sleep", "3600"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: prometheus-server
+bash
+kubectl apply -f debug-pvc-pod.yaml
+kubectl wait --for=condition=Ready pod/prometheus-wal-cleanup -n prometheus --timeout=60s
+Step 5 — Back up the WAL first (cheap insurance, skip only if disk space is tight)
+bash
+kubectl exec -it prometheus-wal-cleanup -n prometheus -- sh -c 'du -sh /data/wal'
+# If you have space to spare on the volume or want extra safety, tar it before deleting:
+kubectl exec -it prometheus-wal-cleanup -n prometheus -- sh -c 'tar -czf /data/wal-backup-$(date +%s).tar.gz -C /data wal 2>/dev/null || echo "skipping backup, low space"'
+Step 6 — Clear the WAL and the lockfile
+bash
+kubectl exec -it prometheus-wal-cleanup -n prometheus -- sh -c 'rm -rf /data/wal/*'
+kubectl exec -it prometheus-wal-cleanup -n prometheus -- sh -c 'rm -f /data/lock'
+kubectl exec -it prometheus-wal-cleanup -n prometheus -- sh -c 'ls -la /data'
+
+Confirm wal/ is now empty and the persisted block directories (the 01K... ULID-named dirs) are still present and untouched.
+
+Step 7 — Tear down the debug pod
+bash
+kubectl delete pod prometheus-wal-cleanup -n prometheus
+Step 8 — (Recommended) Raise the memory limit before bringing Prometheus back
+
+Give it headroom so a future replay/compaction doesn't OOM again:
+
+bash
+kubectl set resources deployment prometheus-server -n prometheus --limits=memory=120Gi -c prometheus
+# or for statefulset:
+kubectl set resources statefulset prometheus-server -n prometheus --limits=memory=120Gi -c prometheus
+
+(Adjust the number based on your node's actual free memory from kubectl top node ahab1205 — don't set it above what the node can realistically give it.)
+
+Step 9 — Scale back up
+bash
+kubectl scale deployment prometheus-server -n prometheus --replicas=1
+# or
+kubectl scale statefulset prometheus-server -n prometheus --replicas=1
+Step 10 — Watch startup closely
+bash
+kubectl get pod -n prometheus -l app=prometheus-server -w
+
+In another terminal, tail logs:
+
+bash
+kubectl logs -f -n prometheus -l app=prometheus-server
+
+With WAL cleared, startup should now skip the long replay entirely and reach "Server is ready to receive web requests." within seconds/a couple minutes, not 11+ minutes.
+
+Step 11 — Verify it's actually healthy
+bash
+kubectl get pod -n prometheus -l app=prometheus-server
+kubectl top pod -n prometheus -l app=prometheus-server
+kubectl exec -it <new-pod> -n prometheus -- wget -qO- http://localhost:9090/-/ready
+
+Should return Prometheus Server is Ready.
+
+Step 12 — Confirm no immediate restart, then move to root-cause hardening
+
+Once stable for 15–20 minutes with restartCount still at 0, you're past the crisis. After that, worth circling back to:
+
+Why did the WAL grow to 371GB in the first place (likely the crash loop itself, but worth confirming compaction interval settings)
+Whether the memory limit needs to stay permanently higher or if there's a cardinality/retention issue driving baseline usage up
+Checking kubectl top node ahab1205 periodically to make sure the new limit doesn't create node-level pressure for other pods
