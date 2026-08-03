@@ -96,3 +96,19 @@ Likely fix path
 Given the pattern (long replay + GOGC auto-tuning down to 75 + OOM after ~16 min), this looks like a memory limit that's undersized for your actual series/cardinality, not a fluke. The fix is almost certainly to raise resources.limits.memory on the prometheus-server container — possibly significantly, since replay memory usage can spike well above steady-state serving memory.
 
 Want to pull the current resource limits and TSDB series count so we can size an appropriate increase?
+
+
+
+# 1. Is it still in replay, or has it actually stabilized as unready?
+kubectl logs prometheus-server-6cf788db4b-cl2hv -n prometheus | grep -i "replay\|ready to receive"
+
+# 2. Current memory usage on the new node - is it climbing toward another OOM?
+kubectl top pod prometheus-server-6cf788db4b-cl2hv -n prometheus
+
+# 3. Has it actually restarted yet, or is this still the original container?
+kubectl get pod prometheus-server-6cf788db4b-cl2hv -n prometheus -o jsonpath='{.status.containerStatuses[0].restartCount}'
+
+# 4. Node memory pressure on ahab1205 - the real test of your hypothesis
+kubectl describe node ahab1205 | grep -A5 "Allocated resources"
+kubectl top node ahab1205
+
