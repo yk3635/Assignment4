@@ -65,3 +65,14 @@ kubectl get secret <jenkins-secret-name> -n <namespace> -o jsonpath='{.data.CASC
 
 kubectl get secret <jenkins-secret-name> -n <namespace> -o jsonpath='{.data.CASC_JENKINS_CONFIG}' | base64 -d
 
+
+
+
+
+cat > /tmp/check_quota.sh << 'EOF'
+curl -s --cacert /etc/ssl/etcd/ssl/ca.pem \
+  --cert /etc/ssl/etcd/ssl/node-ahab1101.pem \
+  --key /etc/ssl/etcd/ssl/node-ahab1101-key.pem \
+  https://10.80.10.11:2379/metrics | grep quota
+EOF
+bash /tmp/check_quota.sh
