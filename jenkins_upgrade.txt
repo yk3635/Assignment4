@@ -1,0 +1,116 @@
+Step 1: Extract Vault's certificate chain
+
+From a pod with network access to Vault (your test Jenkins pod works):
+
+bash
+kubectl exec -it <jenkins-test-pod> -n jenkins -c jenkins -- \
+  sh -c "openssl s_client -connect vault-prod-active.vault:8200 -showcerts </dev/null 2>/dev/null" > /tmp/vault-chain.txt
+
+Copy it to your local machine:
+
+bash
+kubectl cp jenkins/<jenkins-test-pod>:/tmp/vault-chain.txt ./vault-chain.txt -c jenkins
+Step 2: Split into individual certificates
+bash
+csplit -z -f vault-cert- -b '%02d.pem' vault-chain.txt '/-----BEGIN CERTIFICATE-----/' '{*}'
+Step 3: Identify which cert is the CA
+bash
+for f in vault-cert-*.pem; do
+  echo "=== $f ==="
+  openssl x509 -in "$f" -noout -subject -issuer 2>/dev/null
+  echo ""
+done
+
+Look for:
+
+Leaf cert: subject matches vault-prod-active.vault (or similar) — this is Vault's own identity, don't need to trust this directly.
+Intermediate CA(s): subject ≠ issuer, but issuer chains toward the root.
+Root CA: subject = issuer (self-signed) — this is the one we ultimately need trusted, but it's safest to include the full chain (intermediates + root) in the bundle.
+
+Build the trust bundle from everything except the leaf cert:
+
+bash
+cat vault-cert-01.pem vault-cert-02.pem > vault-ca-bundle.pem   # adjust filenames based on step 3 output
+Step 4: Create a ConfigMap with the CA bundle
+
+Important — confirm your kubectl context/namespace targets your test environment, not prod, before running this:
+
+bash
+kubectl config current-context
+kubectl create configmap vault-ca-cert -n jenkins --from-file=vault-ca-bundle.pem=./vault-ca-bundle.pem
+Step 5: Update your Helm values to add the init container and trust store
+
+In jenkins.values.yaml (your test/jenkins_upgrade branch), add:
+
+yaml
+extraVolumes:
+  - name: vault-ca-cert
+    configMap:
+      name: vault-ca-cert
+  - name: custom-cacerts
+    emptyDir: {}
+
+extraInitContainers:
+  - name: init-vault-truststore
+    image: registry.io/bitnami/jenkins:2.516.2-debian-12-r0
+    command:
+      - /bin/bash
+      - -c
+      - |
+        cp /opt/bitnami/java/lib/security/cacerts /custom-cacerts/cacerts
+        keytool -importcert -trustcacerts -noprompt \
+          -alias vault-ca \
+          -file /vault-ca/vault-ca-bundle.pem \
+          -keystore /custom-cacerts/cacerts \
+          -storepass changeit
+    volumeMounts:
+      - name: vault-ca-cert
+        mountPath: /vault-ca
+      - name: custom-cacerts
+        mountPath: /custom-cacerts
+
+extraVolumeMounts:
+  - name: custom-cacerts
+    mountPath: /opt/bitnami/jenkins/custom-truststore
+
+Note: -alias vault-ca only works if your bundle has one cert. If vault-ca-bundle.pem contains multiple certs (intermediate + root), keytool -importcert will only import the first one when using a single -file/-alias pair — you'd need separate keytool calls per cert, each with a unique alias:
+
+bash
+keytool -importcert -trustcacerts -noprompt -alias vault-ca-1 -file /vault-ca/vault-cert-01.pem -keystore /custom-cacerts/cacerts -storepass changeit
+keytool -importcert -trustcacerts -noprompt -alias vault-ca-2 -file /vault-ca/vault-cert-02.pem -keystore /custom-cacerts/cacerts -storepass changeit
+
+I'd mount the individual vault-cert-*.pem files (via the ConfigMap, using --from-file per file) rather than the combined bundle, so you can loop over them cleanly in the init container command instead.
+
+Step 6: Point the JVM at the new trust store
+
+First, confirm which env var this Bitnami chart actually uses:
+
+bash
+grep -rn "JAVA_OPTS\|JENKINS_JAVA_OPTS\|JAVA_TOOL_OPTIONS" jenkins.values.yaml jenkins-configs/
+
+Then add (adjust the variable name based on what you find):
+
+yaml
+extraEnvVars:
+  - name: JAVA_OPTS
+    value: "-Djavax.net.ssl.trustStore=/opt/bitnami/jenkins/custom-truststore/cacerts -Djavax.net.ssl.trustStorePassword=changeit"
+Step 7: Deploy to your test environment only
+bash
+helm list -n jenkins   # confirm release names first
+helm upgrade <your-test-release-name> <chart-path> -n jenkins -f jenkins.values.yaml -f jenkins-configs/values.yaml
+
+Or if ArgoCD manages this, commit to jenkins_upgrade and let it sync (confirm the Application targets your test release, not prod).
+
+Step 8: Verify
+bash
+kubectl exec -it <new-jenkins-pod> -n jenkins -c jenkins -- \
+  keytool -list -keystore /opt/bitnami/jenkins/custom-truststore/cacerts -storepass changeit | grep -i vault
+
+Should now show your imported alias(es).
+
+Then check the logs:
+
+bash
+kubectl logs <new-jenkins-pod> -n jenkins -c jenkins | grep -i vault
+
+Expect to see clean Vault#<init> success messages with no SunCertPathBuilderException, and no more "unresolved variable" warnings for anything Vault-sourced.
