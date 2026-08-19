@@ -75,21 +75,29 @@ echo ""
 if [[ -z "${GITLAB_URL:-}" || -z "${GITLAB_TOKEN:-}" ]]; then
     fail "Skipping live checks — GITLAB_URL and/or GITLAB_TOKEN missing"
 else
-    # Reachability
+    # /-/health is unauthenticated and, by default, restricted to an IP
+    # allowlist (monitoring_whitelist in gitlab.rb) — GitLab returns 404
+    # rather than 403 for callers outside that range, to avoid confirming
+    # the endpoint exists. A 404 here is NOT a reliable "instance is down"
+    # signal, so we only warn on it and let the authenticated API call
+    # below be the real reachability gate.
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${GITLAB_URL}/-/health" 2>/dev/null)
     if [[ "$HTTP_CODE" == "200" ]]; then
         pass "GitLab instance reachable (/-/health -> 200)"
     else
-        fail "GitLab instance not reachable or unhealthy (/-/health -> HTTP $HTTP_CODE)"
+        warn "/-/health -> HTTP $HTTP_CODE (likely IP-allowlisted, not necessarily down — verified below via authenticated API call instead)"
     fi
 
-    # Token auth
-    USER_RESP=$(curl -s --max-time 10 -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "${GITLAB_URL}/api/v4/user")
-    USERNAME=$(echo "$USER_RESP" | grep -o '"username":"[^"]*"' | head -1 | cut -d'"' -f4)
-    if [[ -n "$USERNAME" ]]; then
-        pass "Token authenticates successfully as user: $USERNAME"
+    # Token auth — this IS the real reachability + health gate, since it
+    # requires Puma/Workhorse/DB to all be up and answering.
+    USER_RESP=$(curl -s -w '\n%{http_code}' --max-time 10 -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "${GITLAB_URL}/api/v4/user")
+    USER_HTTP_CODE=$(echo "$USER_RESP" | tail -1)
+    USER_BODY=$(echo "$USER_RESP" | sed '$d')
+    USERNAME=$(echo "$USER_BODY" | grep -o '"username":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [[ "$USER_HTTP_CODE" == "200" && -n "$USERNAME" ]]; then
+        pass "GitLab instance reachable and healthy (authenticated API call succeeded as user: $USERNAME)"
     else
-        fail "Token authentication failed — response: $(echo "$USER_RESP" | head -c 200)"
+        fail "GitLab instance not reachable/healthy, or token invalid — HTTP $USER_HTTP_CODE, response: $(echo "$USER_BODY" | head -c 200)"
     fi
 
     # Token scope check (does it have api scope?)
