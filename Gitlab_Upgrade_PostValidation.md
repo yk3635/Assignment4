@@ -1,3 +1,85 @@
+This spans 5 minor/major upgrade stops with a lot of ground to cover — let me pull the release notes and deprecations for each stop.Now let me get 18.11 more details, 19.0, 19.1, and deprecations.Now let me get 19.0 and 19.1 release highlights, plus deprecations across the range.This gives me a lot of the picture. Let me now check deprecations/breaking changes specific to this jump and 19.1/19.2 essentials.I now have a comprehensive picture. Given the volume, here's a consolidated summary organized by version.I have enough now to give you a complete, organized summary. Here it is:
+
+# GitLab 18.2.6 → 19.2.4 — Full Change Summary
+
+## 18.2.6 → 18.2.8 (patch releases only)
+No new features — these are security/bug-fix patches. 18.2.8 was released with 18.4.2 and 18.3.4 on October 8, 2025, containing important bug and security fixes. Nothing functionally changes for you here.
+
+## 18.2 → 18.5 (skips 18.3, 18.4 — not required stops, but worth knowing)
+Key things introduced along this stretch:
+- A new personal homepage consolidating to-do items, assigned issues, merge requests, review requests, and recently viewed content.
+- Pipeline secret detection validity checks (beta) — shows whether a detected secret is actually active, so you don't waste time triaging dead credentials.
+- GitLab Security Analyst Agent (beta) — an AI agent in Duo Agentic Chat that can list vulnerabilities, pull CVE/EPSS data, confirm/dismiss findings, and create vulnerability issues.
+- A new panel-based UI with GitLab Duo Chat persistently visible across the platform.
+
+## 18.5 → 18.8 (skips 18.6, 18.7)
+- Multi-container scanning (beta) — pass an array of images into a single Container Scanning job.
+- Ability for Group Owners to disable SSH keys for all enterprise users in a group.
+- Security Analyst Agent reached general availability — lets security teams triage, assess, and remediate vulnerabilities via natural-language chat instead of clicking through dashboards.
+- GitLab Duo Agent Platform expanded with namespace-level access rules and LDAP/SAML governance integration.
+
+## 18.8 → 18.11 (skips 18.9, 18.10 — your last stop before 19.x)
+This is a big one — most relevant to your day-to-day:
+- Agentic SAST Vulnerability Resolution reached GA — autonomously analyzes SAST findings and opens ready-to-review MRs with proposed fixes.
+- Data Analyst Foundational Agent (GA) — AI chat assistant for querying/visualizing platform data via GLQL.
+- CI Expert Agent (beta) — inspects your repo and generates a working `.gitlab-ci.yml` from a guided conversation.
+- Vulnerability management policies can now auto-adjust severity based on CVE/CWE/file path conditions.
+- Service accounts can now be scoped to subgroups/projects (not just top-level groups) and are available on GitLab Free (up to 100 per top-level group).
+- Fine-grained personal access tokens (beta) — scope a PAT to specific resources/actions instead of full account access.
+- Gitaly can now be deployed on Kubernetes as a fully supported method — relevant given your Kubespray/ArgoCD environment.
+- Kubernetes 1.35 is now fully supported.
+- CI/CD inputs can now be reconfigured when manually re-running merge request pipelines.
+- ⚠️ **Ops note:** Upgrades to 18.11 attempt to auto-upgrade packaged PostgreSQL to version 17 in preparation for the GitLab 19.0 minimum-version requirement — not relevant to you since you run this in Docker with your own Postgres, but worth confirming your Postgres is already ≥17 before the 19.0 hop.
+
+## 18.11 → 19.0 (major version — most breaking changes live here)
+**New:**
+- Group-level custom review instructions for GitLab Duo code review, so teams no longer duplicate instructions per project.
+- Configurable custom work item types (User Story, Bug, Maintenance, etc.) beyond just Issue/Task.
+- GitLab Secrets Manager reaches open beta — built-in CI/CD secret storage as an alternative to Vault/AWS Secrets Manager. (Worth a look given you already run HashiCorp Vault.)
+- Dependency scanning by SBOM reaches GA for Maven, Gradle, and Python, with automatic dependency-graph resolution.
+- Claude Opus 4.7 became available in GitLab Duo Agent Platform.
+- Merge conflict resolution via GitLab Duo (beta) — Duo can edit conflicting files, commit, and push.
+
+**Removed/breaking (all relevant to your self-managed Docker deployment):**
+- PostgreSQL 17 is now the minimum supported version.
+- Ubuntu 20.04 Linux packages discontinued.
+- Redis 6 support removed — external Redis must be 7.0+ (7.2 or Valkey 7.2 recommended); the bundled Redis has been on 7.x since 16.2, unaffected.
+- Bundled Mattermost removed from the Linux package.
+- SUSE distribution packages discontinued.
+- Spamcheck removed from Linux package/Helm chart.
+- The legacy S3 container registry storage driver (AWS SDK v1) is removed — `s3`/`s3aws` driver names now alias to `s3_v2`.
+- Since you run **GitLab CE in Docker** (not the Helm chart or bare Linux package), the NGINX Ingress→Envoy Gateway and bundled Postgres/Redis/MinIO Helm removals don't apply to you directly, but the **PostgreSQL 17 minimum** and **Redis 6 removal** do apply if your external DB/Redis versions are older.
+
+## 19.0 → 19.1
+- Secret false positive detection with GitLab Duo reaches GA — AI automatically flags likely false-positive secret detections with a confidence score.
+- "Always on" GitLab Duo availability mode — admins can lock Duo on instance/group-wide (companion to the existing "always off").
+- Automatic Code Owner reviewer assignment based on CODEOWNERS file.
+- Compliance framework templates (beta) — 19 prebuilt templates including ISO 27001, SOC 2, FedRAMP, NIST, CIS.
+- Secret detection in feature branches now scans every commit since divergence from default branch, not just the latest commit/push.
+- Custom lifetime for OAuth access tokens (300–7200 seconds), useful for MCP client integrations.
+- Third-party SARIF 2.1.0 scanner results (Semgrep, Checkmarx, Trivy, Snyk, Gitleaks) can now feed into GitLab's native vulnerability management.
+- ⚠️ Fixed the web_hook_logs_daily issue you hit earlier — backported in the 19.1.1 patch.
+
+## 19.1 → 19.2
+- Dependency Scanning Auto-Remediation (public beta) — opens an MR when a vulnerable dependency is found, and an agent iterates on the same MR until the pipeline passes ("Agentic Breaking Change Resolution") if the fix breaks the build.
+- Security Review Flow — detects business logic vulnerabilities directly in merge requests, going beyond static analysis.
+- CI Expert Agent reaches GA, integrating with Orbit's Knowledge Graph for more context-aware pipeline recommendations.
+- Fine-grained PATs reach GA with full REST API coverage and most-common GraphQL coverage.
+- Agentic Chat can now hand off to specialist flows (e.g., Developer Flow) directly from a chat conversation.
+- Admins can disable built-in project templates globally or per group.
+- ⚠️ **Known issue (patched by 19.2.1):** if you'd upgraded straight to 19.2.0, GitLab Duo Self-Hosted service endpoint settings could be cleared — not relevant since you're going straight to 19.2.4.
+
+## Practical takeaways for your environment
+1. **PostgreSQL and Redis versions** — confirm both meet the 19.0 minimums (PG 17+, Redis 7.0+) before you cut over, since you're on external/self-managed infra, not the Bitnami-bundled stack.
+2. **GitLab Secrets Manager (19.0, open beta)** is worth evaluating given your existing Vault integration — could reduce moving parts for CI/CD secrets specifically.
+3. **Agentic SAST/Dependency Scanning features (18.11 → 19.2)** are a meaningful jump if you use GitLab's built-in scanning — several went beta→GA across this range.
+4. **Fine-grained PATs (beta in 18.11, GA in 19.2)** — worth rolling out to replace legacy broad-scope PATs where you can, for tighter access control across your ops team.
+
+
+
+
+   
+
 # GitLab Post-Upgrade Validation Runbook
 
 **Scope:** Validate GitLab CE after 18.11.11 → 19.2.4 upgrade — CI/CD, tokens,
