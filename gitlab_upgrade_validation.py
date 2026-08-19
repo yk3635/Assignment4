@@ -479,7 +479,8 @@ def check_runners():
     for r in runners:
         print(f"      -> runner '{r.get('description')}' id={r.get('id')} "
               f"status={r.get('status', 'n/a')} paused={r.get('paused', 'n/a')} "
-              f"type={r.get('runner_type', 'n/a')} tags={r.get('tag_list', [])}")
+              f"type={r.get('runner_type', 'n/a')} locked={r.get('locked', 'n/a')} "
+              f"access_level={r.get('access_level', 'n/a')} tags={r.get('tag_list', [])}")
 
     if not online:
         print("      -> no online runners found — pipeline check will likely stay pending")
@@ -527,6 +528,29 @@ def ensure_project_runner_access(project_id, runner_id, runner_type):
     record(f"Enable shared/group runner access for validation project (runner type: {runner_type})", ok,
            "shared_runners_enabled=true, group_runners_enabled=true" if ok
            else f"HTTP {resp.status_code}: {resp.text[:200]}")
+
+    # Verify what actually stuck — a 200 on the PUT doesn't guarantee the
+    # values took effect if something upstream (group policy) is overriding
+    # them. Read the project back and print the real values.
+    ok2, resp2 = req("GET", f"/projects/{project_id}")
+    if ok2:
+        pdata = resp2.json()
+        print(f"      -> verified on project: shared_runners_enabled="
+              f"{pdata.get('shared_runners_enabled')}, group_runners_enabled="
+              f"{pdata.get('group_runners_enabled')}")
+
+    # Check group-level policy — if the group enforces "disabled and
+    # unoverridable", no project-level flag can turn shared runners on,
+    # which would exactly explain a PUT that reports success but has no effect.
+    if NAMESPACE:
+        ok3, resp3 = req("GET", f"/groups/{NAMESPACE}")
+        if ok3:
+            gdata = resp3.json()
+            setting = gdata.get("shared_runners_setting")
+            if setting:
+                print(f"      -> group '{NAMESPACE}' shared_runners_setting = '{setting}'"
+                      + (" <-- THIS BLOCKS project-level overrides regardless of the flag above"
+                         if setting == "disabled_and_unoverridable" else ""))
 
 
 # ---------------------------------------------------------------------------
