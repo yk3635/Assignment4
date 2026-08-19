@@ -61,7 +61,9 @@ NAMESPACE = os.environ.get("GITLAB_NAMESPACE", "")
 EXPECTED_VERSION = os.environ.get("EXPECTED_VERSION", "")
 KEEP_TEST_PROJECT = os.environ.get("KEEP_TEST_PROJECT", "0") == "1"
 VERIFY_TLS = os.environ.get("GITLAB_VERIFY_TLS", "1") != "0"
-TIMEOUT = 30
+SSH_PRIVATE_KEY_PATH = os.environ.get("GIT_SSH_PRIVATE_KEY_PATH", "")
+GIT_PROTOCOL_PREF = os.environ.get("GIT_TEST_PROTOCOL", "auto")  # auto | https | ssh
+WEBHOOK_TEST_URL = os.environ.get("WEBHOOK_TEST_URL", "https://httpbin.org/post")
 
 if not GITLAB_URL or not TOKEN:
     print("ERROR: set GITLAB_URL and GITLAB_TOKEN environment variables.")
@@ -207,55 +209,85 @@ def check_file_upload(project_id):
 # ---------------------------------------------------------------------------
 # 5. Git operations (HTTPS)
 # ---------------------------------------------------------------------------
-def check_git_https(project):
-    clone_url = project["http_url_to_repo"]
-    # inject token for auth: https://oauth2:<token>@host/path.git
-    proto, rest = clone_url.split("://", 1)
-    auth_url = f"{proto}://oauth2:{TOKEN}@{rest}"
+def _git_env_for_ssh():
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    ssh_opts = ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10"]
+    if SSH_PRIVATE_KEY_PATH:
+        ssh_opts += ["-i", SSH_PRIVATE_KEY_PATH]
+    env["GIT_SSH_COMMAND"] = "ssh " + " ".join(ssh_opts)
+    return env
 
-    tmpdir = tempfile.mkdtemp(prefix="gl-validate-")
-    # Use a shorter timeout with git's own connect-timeout so a bad/unreachable
-    # clone URL fails fast with a clear message instead of hanging until the
-    # outer subprocess timeout kills it.
-    git_env = os.environ.copy()
-    git_env["GIT_TERMINAL_PROMPT"] = "0"  # never hang waiting for interactive credential prompt
-    git_ssl_opts = [] if VERIFY_TLS else ["-c", "http.sslVerify=false"]
 
+def _try_git_clone(clone_url, tmpdir, env, timeout=30):
+    ssl_opts = [] if VERIFY_TLS else ["-c", "http.sslVerify=false"]
     try:
         r = subprocess.run(
-            ["git"] + git_ssl_opts + ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=15",
-             "clone", "--quiet", "--depth", "1", auth_url, tmpdir],
-            capture_output=True, text=True, timeout=30, env=git_env,
+            ["git"] + ssl_opts + ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=15",
+             "clone", "--quiet", "--depth", "1", clone_url, tmpdir],
+            capture_output=True, text=True, timeout=timeout, env=env,
         )
-        clone_ok = r.returncode == 0
-        record("Git clone (HTTPS)", clone_ok,
-               (r.stderr.strip()[:300] if not clone_ok else
-                f"cloned from {clone_url} (if this URL isn't reachable from where you're running "
-                f"this script, check external_url in gitlab.rb matches how you access the instance)"))
-        if not clone_ok:
-            record("Git commit", False, "skipped — clone failed")
-            record("Git push (HTTPS)", False, "skipped — clone failed")
-            record("Git pull (HTTPS)", False, "skipped — clone failed")
-            return
+        return r.returncode == 0, (r.stderr or "").strip()[:300]
     except subprocess.TimeoutExpired:
-        record("Git clone (HTTPS)", False,
-               f"TIMED OUT after 30s cloning {clone_url} — this usually means the clone URL GitLab "
-               f"returned isn't actually reachable from here (check external_url in gitlab.rb vs. "
-               f"the URL/proxy path you're using to reach the instance), not a credential problem")
-        record("Git commit", False, "skipped — clone timed out")
-        record("Git push (HTTPS)", False, "skipped — clone timed out")
-        record("Git pull (HTTPS)", False, "skipped — clone timed out")
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return
+        return False, f"TIMED OUT after {timeout}s"
     except Exception as e:
-        record("Git clone (HTTPS)", False, f"unexpected error: {e}")
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return
+        return False, f"unexpected error: {e}"
 
+
+def check_git_ops(project):
+    """
+    Tries HTTPS first (fast, no SSH key needed), and falls back to SSH if
+    HTTPS is disabled/blocked at the instance level (common: git access
+    protocol restricted to SSH only). Set GIT_TEST_PROTOCOL=https or
+    GIT_TEST_PROTOCOL=ssh to force one, or leave as 'auto' (default).
+    """
+    https_url = project["http_url_to_repo"]
+    proto, rest = https_url.split("://", 1)
+    https_auth_url = f"{proto}://oauth2:{TOKEN}@{rest}"
+    ssh_url = project.get("ssh_url_to_repo")
+
+    protocol_used = None
+    clone_url = None
+    git_env = os.environ.copy()
+    git_env["GIT_TERMINAL_PROMPT"] = "0"
+
+    attempts = []
+    if GIT_PROTOCOL_PREF in ("auto", "https"):
+        attempts.append(("https", https_auth_url, git_env))
+    if GIT_PROTOCOL_PREF in ("auto", "ssh") and ssh_url:
+        attempts.append(("ssh", ssh_url, _git_env_for_ssh()))
+
+    tmpdir = tempfile.mkdtemp(prefix="gl-validate-")
+    last_detail = ""
     try:
+        for proto_name, url, env in attempts:
+            ok, detail = _try_git_clone(url, tmpdir, env, timeout=30)
+            if ok:
+                protocol_used = proto_name
+                clone_url = url
+                break
+            last_detail = f"[{proto_name}] {detail}"
+            print(f"      -> {proto_name} clone failed ({detail}), "
+                  f"{'trying next protocol...' if GIT_PROTOCOL_PREF == 'auto' else 'not retrying (protocol forced)'}")
+
+        if protocol_used is None:
+            record("Git clone", False,
+                   f"failed on all attempted protocol(s) ({GIT_PROTOCOL_PREF}). Last error: {last_detail}. "
+                   f"If HTTPS git access is disabled instance-wide, set GIT_TEST_PROTOCOL=ssh and "
+                   f"GIT_SSH_PRIVATE_KEY_PATH=/path/to/key (the key must be registered against the "
+                   f"user owning GITLAB_TOKEN).")
+            record("Git commit", False, "skipped — clone failed")
+            record("Git push", False, "skipped — clone failed")
+            record("Git pull", False, "skipped — clone failed")
+            return
+        record(f"Git clone ({protocol_used.upper()})", True, f"cloned via {protocol_used}")
+
         test_file = os.path.join(tmpdir, "validation-file.txt")
         with open(test_file, "w") as f:
             f.write(f"validation run {RUN_ID}\n")
+
+        env = _git_env_for_ssh() if protocol_used == "ssh" else git_env
+        ssl_opts = [] if VERIFY_TLS else ["-c", "http.sslVerify=false"]
 
         subprocess.run(["git", "-C", tmpdir, "config", "user.email", "validation@local"], check=True, timeout=10)
         subprocess.run(["git", "-C", tmpdir, "config", "user.name", "Upgrade Validation"], check=True, timeout=10)
@@ -264,15 +296,15 @@ def check_git_https(project):
                             capture_output=True, text=True, timeout=10)
         record("Git commit", r.returncode == 0, r.stderr.strip()[:300])
 
-        r = subprocess.run(["git"] + git_ssl_opts + ["-C", tmpdir, "push", "origin", "HEAD"],
-                            capture_output=True, text=True, timeout=30, env=git_env)
-        record("Git push (HTTPS)", r.returncode == 0, (r.stderr or r.stdout).strip()[:400])
+        r = subprocess.run(["git"] + ssl_opts + ["-C", tmpdir, "push", "origin", "HEAD"],
+                            capture_output=True, text=True, timeout=30, env=env)
+        record(f"Git push ({protocol_used.upper()})", r.returncode == 0, (r.stderr or r.stdout).strip()[:400])
 
-        r = subprocess.run(["git"] + git_ssl_opts + ["-C", tmpdir, "pull", "--quiet"],
-                            capture_output=True, text=True, timeout=30, env=git_env)
-        record("Git pull (HTTPS)", r.returncode == 0, r.stderr.strip()[:300])
-    except subprocess.TimeoutExpired as e:
-        record(f"Git operation ({' '.join(e.cmd[:3])}...)", False, "timed out")
+        r = subprocess.run(["git"] + ssl_opts + ["-C", tmpdir, "pull", "--quiet"],
+                            capture_output=True, text=True, timeout=30, env=env)
+        record(f"Git pull ({protocol_used.upper()})", r.returncode == 0, r.stderr.strip()[:300])
+    except subprocess.TimeoutExpired:
+        record("Git commit/push/pull", False, "timed out")
     except Exception as e:
         record("Git commit/push/pull", False, f"unexpected error: {e}")
     finally:
@@ -282,15 +314,11 @@ def check_git_https(project):
 # ---------------------------------------------------------------------------
 # 6. Merge request flow
 # ---------------------------------------------------------------------------
-def check_merge_request(project_id):
+def check_merge_request(project_id, default_branch):
     branch = f"validation-branch-{RUN_ID}"
     ok, resp = req("POST", f"/projects/{project_id}/repository/branches",
-                    json={"branch": branch, "ref": "main"}, expect=(201,))
-    if not ok:
-        # fall back to master if main doesn't exist
-        ok, resp = req("POST", f"/projects/{project_id}/repository/branches",
-                        json={"branch": branch, "ref": "master"}, expect=(201,))
-    record("Create branch", ok, f"HTTP {resp.status_code}")
+                    json={"branch": branch, "ref": default_branch}, expect=(201,))
+    record("Create branch", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
     if not ok:
         return
 
@@ -304,12 +332,8 @@ def check_merge_request(project_id):
         return
 
     ok, resp = req("POST", f"/projects/{project_id}/merge_requests", json={
-        "source_branch": branch, "target_branch": "main", "title": "Validation MR"
+        "source_branch": branch, "target_branch": default_branch, "title": "Validation MR"
     }, expect=(201,))
-    if not ok:
-        ok, resp = req("POST", f"/projects/{project_id}/merge_requests", json={
-            "source_branch": branch, "target_branch": "master", "title": "Validation MR"
-        }, expect=(201,))
     record("Create merge request", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
     if not ok:
         return
@@ -317,7 +341,11 @@ def check_merge_request(project_id):
 
     time.sleep(2)
     ok, resp = req("PUT", f"/projects/{project_id}/merge_requests/{mr_iid}/merge", expect=(200, 201))
-    record("Merge the merge request", ok, f"HTTP {resp.status_code}: {resp.text[:300]}" if not ok else "")
+    record("Merge the merge request", ok,
+           f"HTTP {resp.status_code}: {resp.text[:300]}" +
+           (" — likely a permissions gap: the token's user needs at least Maintainer "
+            "role on this project/group to merge (Developer can create MRs but not merge them "
+            "if merge permissions are restricted)" if resp.status_code == 401 else "") if not ok else "")
 
 
 # ---------------------------------------------------------------------------
@@ -341,18 +369,12 @@ validation_job:
 """
 
 
-def check_pipeline(project_id, project):
+def check_pipeline(project_id, project, default_branch):
     ok, resp = req("POST", f"/projects/{project_id}/repository/commits", json={
-        "branch": "main",
+        "branch": default_branch,
         "commit_message": "add validation ci config",
         "actions": [{"action": "create", "file_path": ".gitlab-ci.yml", "content": CI_YAML}]
     }, expect=(201,))
-    if not ok:
-        ok, resp = req("POST", f"/projects/{project_id}/repository/commits", json={
-            "branch": "master",
-            "commit_message": "add validation ci config",
-            "actions": [{"action": "create", "file_path": ".gitlab-ci.yml", "content": CI_YAML}]
-        }, expect=(201,))
     record("Push .gitlab-ci.yml", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
     if not ok:
         return
@@ -427,7 +449,7 @@ def check_runners():
 # ---------------------------------------------------------------------------
 def check_webhook(project_id):
     ok, resp = req("POST", f"/projects/{project_id}/hooks", json={
-        "url": "https://httpbin.org/post",
+        "url": WEBHOOK_TEST_URL,
         "push_events": True,
         "issues_events": True,
         "enable_ssl_verification": True
@@ -438,7 +460,13 @@ def check_webhook(project_id):
     hook_id = resp.json()["id"]
 
     ok, resp = req("POST", f"/projects/{project_id}/hooks/{hook_id}/test/push_events", expect=(201, 200))
-    record("Trigger webhook test event", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
+    if not ok and resp.status_code == 422 and "blocked" in resp.text.lower():
+        print(f"[INFO] Webhook test target ({WEBHOOK_TEST_URL}) blocked by outbound URL allowlist "
+              f"(SSRF protection) — this is likely a network policy working as intended, not an "
+              f"upgrade regression. Set WEBHOOK_TEST_URL to an internally-reachable endpoint to get "
+              f"a real pass/fail signal.")
+    else:
+        record("Trigger webhook test event", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
 
 
 # ---------------------------------------------------------------------------
@@ -491,13 +519,14 @@ def main():
 
     project = create_test_project()
     project_id = project["id"]
+    default_branch = project.get("default_branch", "main")
     try:
         check_issue_lifecycle(project_id)
         check_file_upload(project_id)
-        check_git_https(project)
-        check_merge_request(project_id)
+        check_git_ops(project)
+        check_merge_request(project_id, default_branch)
         check_job_token_scope(project_id)
-        check_pipeline(project_id, project)
+        check_pipeline(project_id, project, default_branch)
         check_webhook(project_id)
         check_access_tokens(project_id)
     finally:
