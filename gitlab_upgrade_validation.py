@@ -401,8 +401,18 @@ def check_pipeline(project_id, project, default_branch):
         return
 
     ok, resp = req("GET", f"/projects/{project_id}/pipelines?ref={ci_branch}&order_by=id&sort=desc&per_page=1")
+    # Pipeline creation is asynchronous after a push/commit — poll briefly
+    # instead of checking once immediately, or a fast check can race ahead
+    # of GitLab actually creating the pipeline object.
+    pipeline_wait_deadline = time.time() + 20
+    while (not ok or not resp.json()) and time.time() < pipeline_wait_deadline:
+        time.sleep(2)
+        ok, resp = req("GET", f"/projects/{project_id}/pipelines?ref={ci_branch}&order_by=id&sort=desc&per_page=1")
     if not ok or not resp.json():
-        record("Pipeline created after push", False, "No pipeline found — check runner/webhook config")
+        record("Pipeline created after push", False,
+               "No pipeline found within 20s — check: (1) CI/CD is enabled for this project "
+               "(Settings > General > Visibility, project features, permissions), (2) pipelines aren't "
+               "disabled instance-wide, (3) no push rules/webhook blocking pipeline creation")
         return
     pipeline = resp.json()[0]
     pipeline_id = pipeline["id"]
