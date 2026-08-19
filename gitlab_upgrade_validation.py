@@ -10,17 +10,18 @@ Covers (automatable):
   - Authentication (PAT)
   - Project / Issue / MR CRUD (core Rails app + DB)
   - File upload / attachment handling
-  - Git operations over HTTPS (clone, push, pull)
-  - CI/CD pipeline trigger + status polling
+  - Git operations (HTTPS, auto-falling back to SSH if HTTPS is disabled)
+  - CI/CD pipeline trigger + status polling (auto-detects a working runner
+    and its real tags, and enables shared/group runner access as needed)
   - CI/CD job token scope settings
   - Runner registration & online status
-  - Webhook delivery
+  - Webhook creation (+ delivery trigger if WEBHOOK_TEST_URL is set)
   - Access tokens (project/group), Deploy tokens
-  - GitLab CLI (glab) basic commands, if installed
 
 NOT covered here (needs manual verification, see companion runbook):
   - UI rendering / navigation / visual regressions
-  - SSH-based git operations (requires runner/agent SSH key setup)
+  - GitLab CLI (glab) — plain git clone/push/pull is covered above; the
+    separate glab tool isn't exercised by this script
   - Container/package registry push-pull (needs docker/npm/etc. tooling)
   - SSO/SAML/LDAP login flows
   - Geo replication (if applicable)
@@ -606,27 +607,6 @@ def check_access_tokens(project_id):
 
 
 # ---------------------------------------------------------------------------
-# 11. GitLab CLI (glab)
-# ---------------------------------------------------------------------------
-def check_glab_cli():
-    if shutil.which("glab") is None:
-        print("[SKIP] glab CLI not found on PATH — optional, skipping CLI checks "
-              "(install glab separately to also validate CLI workflows)")
-        return
-    r = subprocess.run(["glab", "--version"], capture_output=True, text=True)
-    record("glab --version", r.returncode == 0, r.stdout.strip())
-
-    env = os.environ.copy()
-    env["GITLAB_TOKEN"] = TOKEN
-    env["GITLAB_HOST"] = GITLAB_URL
-    r = subprocess.run(["glab", "auth", "status"], capture_output=True, text=True, env=env)
-    record("glab auth status", "Logged in" in (r.stdout + r.stderr), (r.stdout + r.stderr).strip()[:300])
-
-    r = subprocess.run(["glab", "api", "version"], capture_output=True, text=True, env=env)
-    record("glab api version", r.returncode == 0, r.stdout.strip()[:200])
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -636,7 +616,6 @@ def main():
     check_auth()
     check_personal_access_tokens()
     runner_tag, runner_id, runner_type = check_runners()
-    check_glab_cli()
 
     project = create_test_project()
     project_id = project["id"]
