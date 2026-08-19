@@ -359,7 +359,9 @@ def check_merge_request(project_id, default_branch):
 # ---------------------------------------------------------------------------
 # 7. CI/CD pipeline
 # ---------------------------------------------------------------------------
-CI_YAML = """
+def build_ci_yaml(tag=None):
+    tags_block = f"\n  tags:\n    - {tag}" if tag else ""
+    return f"""
 stages:
   - validate
 
@@ -367,23 +369,24 @@ validation_job:
   stage: validate
   script:
     - echo "Upgrade validation pipeline ran successfully"
-    - echo "CI_JOB_TOKEN scope test" 
+    - echo "CI_JOB_TOKEN scope test"
     - env | grep -E '^CI_' | sort
   artifacts:
     paths: []
-    expire_in: 1 hour
+    expire_in: 1 hour{tags_block}
   rules:
     - if: '$CI_PIPELINE_SOURCE == "api" || $CI_PIPELINE_SOURCE == "push"'
 """
 
 
-def check_pipeline(project_id, project, default_branch):
+def check_pipeline(project_id, project, default_branch, runner_tag=None):
     # Push to a dedicated feature branch, not the default branch directly —
     # default branches are commonly protected (only Maintainer+ can push, or
     # push is blocked entirely in favor of MR-only workflows), which would
     # make this check fail on a permissions/policy issue unrelated to the
     # upgrade. Pipelines can be triggered against any branch, so this avoids
     # needing elevated permissions just to run a CI smoke test.
+    ci_yaml = build_ci_yaml(runner_tag)
     ci_branch = f"ci-validation-{RUN_ID}"
     ok, resp = req("POST", f"/projects/{project_id}/repository/branches",
                     json={"branch": ci_branch, "ref": default_branch}, expect=(201,))
@@ -394,10 +397,12 @@ def check_pipeline(project_id, project, default_branch):
     ok, resp = req("POST", f"/projects/{project_id}/repository/commits", json={
         "branch": ci_branch,
         "commit_message": "add validation ci config",
-        "actions": [{"action": "create", "file_path": ".gitlab-ci.yml", "content": CI_YAML}]
+        "actions": [{"action": "create", "file_path": ".gitlab-ci.yml", "content": ci_yaml}]
     }, expect=(201,))
-    record("Push .gitlab-ci.yml", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
+    record("Push .gitlab-ci.yml" + (f" (tagged: {runner_tag})" if runner_tag else " (untagged)"),
+           ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
     if not ok:
+
         return
 
     ok, resp = req("GET", f"/projects/{project_id}/pipelines?ref={ci_branch}&order_by=id&sort=desc&per_page=1")
@@ -433,7 +438,7 @@ def check_pipeline(project_id, project, default_branch):
     if ok:
         for job in resp.json():
             record(f"Job '{job['name']}' status", job["status"] == "success",
-                   f"status={job['status']}, runner={job.get('runner', {}).get('description', 'n/a')}")
+                   f"status={job['status']}, runner={(job.get('runner') or {}).get('description', 'n/a')}")
 
 
 def check_job_token_scope(project_id):
@@ -453,7 +458,7 @@ def check_runners():
         ok, resp = req("GET", "/runners?per_page=100")
     if not ok:
         record("List runners", False, f"HTTP {resp.status_code}")
-        return
+        return None
     runners = resp.json()
     record("List runners", True, f"{len(runners)} runner(s) visible")
 
@@ -473,6 +478,25 @@ def check_runners():
     for r in runners:
         print(f"      -> runner '{r.get('description')}' id={r.get('id')} "
               f"status={r.get('status', 'n/a')} paused={r.get('paused', 'n/a')} tags={r.get('tag_list', [])}")
+
+    # Pick a tag to route the validation pipeline to a runner we know is
+    # actually online, rather than assuming any runner accepts untagged
+    # jobs (many are intentionally configured to require an explicit tag
+    # match, same pattern as tags: uat / tags: k8s in your own CI configs).
+    online_with_tags = [r for r in online if r.get("tag_list")]
+    if online_with_tags:
+        chosen = online_with_tags[0]
+        tag = chosen["tag_list"][0]
+        print(f"      -> will route validation pipeline using tag '{tag}' "
+              f"(matches online runner '{chosen.get('description')}')")
+        return tag
+    elif online:
+        print(f"      -> online runner(s) found but none have tags configured — validation pipeline "
+              f"will run untagged; this only works if that runner has 'Run untagged jobs' enabled")
+        return None
+    else:
+        print(f"      -> no online runners found — pipeline check will likely stay pending regardless of tags")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +569,7 @@ def main():
     check_version()
     check_auth()
     check_personal_access_tokens()
-    check_runners()
+    runner_tag = check_runners()
     check_glab_cli()
 
     project = create_test_project()
@@ -557,7 +581,7 @@ def main():
         check_git_ops(project)
         check_merge_request(project_id, default_branch)
         check_job_token_scope(project_id)
-        check_pipeline(project_id, project, default_branch)
+        check_pipeline(project_id, project, default_branch, runner_tag)
         check_webhook(project_id)
         check_access_tokens(project_id)
     finally:
