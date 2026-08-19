@@ -452,14 +452,14 @@ def check_job_token_scope(project_id):
 # 8. Runners
 # ---------------------------------------------------------------------------
 def check_runners():
-    """Returns (tag, runner_id) for a chosen online runner, or (None, None)."""
+    """Returns (tag, runner_id, runner_type) for a chosen online runner, or (None, None, None)."""
     ok, resp = req("GET", "/runners/all?per_page=100")
     if not ok:
         # non-admin token: fall back to instance-visible runners
         ok, resp = req("GET", "/runners?per_page=100")
     if not ok:
         record("List runners", False, f"HTTP {resp.status_code}")
-        return None, None
+        return None, None, None
     runners = resp.json()
     record("List runners", True, f"{len(runners)} runner(s) visible")
 
@@ -483,44 +483,50 @@ def check_runners():
 
     if not online:
         print("      -> no online runners found — pipeline check will likely stay pending")
-        return None, None
+        return None, None, None
 
-    # Prefer a tagged runner (routing is explicit and predictable), but
-    # remember either way — we'll also explicitly enable this runner on the
-    # throwaway validation project below, since project-type runners (like
-    # a project-specific "uat_baremetal") are NOT automatically available to
-    # newly created projects; they must be enabled per-project, same as
-    # clicking "Enable for this project" in Settings > CI/CD > Runners.
+    # Prefer a tagged runner (routing is explicit and predictable).
     online_with_tags = [r for r in online if r.get("tag_list")]
     chosen = online_with_tags[0] if online_with_tags else online[0]
     tag = chosen["tag_list"][0] if chosen.get("tag_list") else None
+    runner_type = chosen.get("runner_type")
     print(f"      -> will attempt to use runner '{chosen.get('description')}' "
-          f"(id={chosen['id']}, type={chosen.get('runner_type', 'n/a')}"
+          f"(id={chosen['id']}, type={runner_type}"
           f"{', tag=' + tag if tag else ', untagged'})")
-    return tag, chosen["id"]
+    return tag, chosen["id"], runner_type
 
 
-def enable_runner_for_project(project_id, runner_id):
+def ensure_project_runner_access(project_id, runner_id, runner_type):
     """
-    Explicitly enables a project-type runner on the throwaway validation
-    project. This is what fixes jobs showing Runner: None despite the runner
-    being online — project-type runners aren't automatically available to
-    new projects and must be assigned, same as the UI's "Enable for this
-    project" action. No-op (and harmless) if the runner is already a shared
-    or group runner that doesn't need per-project enabling.
+    Makes the chosen runner actually usable by the throwaway validation
+    project. What's needed differs by runner type:
+      - project_type: must be explicitly attached via POST /projects/:id/runners
+        (equivalent to clicking "Enable for this project" in the UI).
+      - instance_type / group_type: already available to any project in
+        scope, but only if the project's shared_runners_enabled /
+        group_runners_enabled flags are on. New projects can default to
+        these being off depending on instance settings, which produces
+        exactly "runner online, untagged/tagged correctly, but Runner: None"
+        with no other visible error.
     """
     if runner_id is None:
         return
-    ok, resp = req("POST", f"/projects/{project_id}/runners", json={"runner_id": runner_id}, expect=(201, 200))
-    if ok:
-        record("Enable runner for validation project", True, f"runner_id={runner_id}")
-    else:
-        # Common benign case: runner is shared/group-type and this endpoint
-        # doesn't apply, or it's already enabled — don't hard-fail on it,
-        # just surface the detail so it's visible if something else is wrong.
-        print(f"[INFO] Could not explicitly enable runner {runner_id} for validation project "
-              f"(HTTP {resp.status_code}: {resp.text[:200]}) — likely already shared/group-enabled, "
-              f"or this token's user lacks Maintainer role needed for this action")
+
+    if runner_type == "project_type":
+        ok, resp = req("POST", f"/projects/{project_id}/runners", json={"runner_id": runner_id}, expect=(201, 200))
+        record("Enable project-type runner for validation project", ok,
+               f"runner_id={runner_id}" if ok else f"HTTP {resp.status_code}: {resp.text[:200]}")
+        return
+
+    # instance_type or group_type — ensure the project's runner-sharing
+    # flags are on rather than trying to "attach" a shared runner (that
+    # endpoint doesn't apply to shared runners and returns a 500 if tried).
+    ok, resp = req("PUT", f"/projects/{project_id}",
+                    json={"shared_runners_enabled": True, "group_runners_enabled": True},
+                    expect=(200,))
+    record(f"Enable shared/group runner access for validation project (runner type: {runner_type})", ok,
+           "shared_runners_enabled=true, group_runners_enabled=true" if ok
+           else f"HTTP {resp.status_code}: {resp.text[:200]}")
 
 
 # ---------------------------------------------------------------------------
@@ -593,13 +599,13 @@ def main():
     check_version()
     check_auth()
     check_personal_access_tokens()
-    runner_tag, runner_id = check_runners()
+    runner_tag, runner_id, runner_type = check_runners()
     check_glab_cli()
 
     project = create_test_project()
     project_id = project["id"]
     default_branch = project.get("default_branch", "main")
-    enable_runner_for_project(project_id, runner_id)
+    ensure_project_runner_access(project_id, runner_id, runner_type)
     try:
         check_issue_lifecycle(project_id)
         check_file_upload(project_id)
