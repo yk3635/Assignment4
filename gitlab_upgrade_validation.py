@@ -34,7 +34,10 @@ Usage:
   python3 gitlab_upgrade_validation.py
 
 Exit code: 0 if all checks pass, 1 if any check fails.
-Cleans up the test project at the end (set KEEP_TEST_PROJECT=1 to skip).
+Cleans up the test project at the end (set KEEP_TEST_PROJECT=1 to skip), or
+set PERSISTENT_PROJECT_PATH to reuse a fixed existing project across runs
+instead — issues/MRs/uploads/pipelines then accumulate as a running history.
+Access tokens and webhooks are ALWAYS revoked/deleted regardless of mode.
 """
 
 import os
@@ -45,6 +48,7 @@ import base64
 import shutil
 import subprocess
 import tempfile
+from urllib.parse import quote
 from datetime import datetime, timezone
 
 try:
@@ -60,7 +64,14 @@ GITLAB_URL = os.environ.get("GITLAB_URL", "").rstrip("/")
 TOKEN = os.environ.get("GITLAB_TOKEN", "")
 NAMESPACE = os.environ.get("GITLAB_NAMESPACE", "")
 EXPECTED_VERSION = os.environ.get("EXPECTED_VERSION", "")
-KEEP_TEST_PROJECT = os.environ.get("KEEP_TEST_PROJECT", "0") == "1"
+PERSISTENT_PROJECT_PATH = os.environ.get("PERSISTENT_PROJECT_PATH", "")  # e.g. "ops/gitlab-upgrade-validation-history"
+                                                                          # when set, reuse this existing project
+                                                                          # instead of creating/deleting a throwaway
+                                                                          # one — issues/MRs/uploads/pipelines
+                                                                          # accumulate as a history across runs
+KEEP_TEST_PROJECT = os.environ.get("KEEP_TEST_PROJECT", "0") == "1"  # only relevant when PERSISTENT_PROJECT_PATH
+                                                                       # is NOT set — keeps a throwaway project
+                                                                       # around for one-off debugging
 VERIFY_TLS = os.environ.get("GITLAB_VERIFY_TLS", "1") != "0"
 TIMEOUT = 30
 SSH_PRIVATE_KEY_PATH = os.environ.get("GIT_SSH_PRIVATE_KEY_PATH", "")
@@ -136,6 +147,20 @@ def check_personal_access_tokens():
 # 3. Project / namespace setup
 # ---------------------------------------------------------------------------
 def create_test_project():
+    if PERSISTENT_PROJECT_PATH:
+        ok, resp = req("GET", f"/projects/{PERSISTENT_PROJECT_PATH.replace('/', '%2F')}")
+        if not ok:
+            record("Resolve persistent validation project", False,
+                   f"HTTP {resp.status_code}: could not find project at "
+                   f"'{PERSISTENT_PROJECT_PATH}' — create it first, or unset PERSISTENT_PROJECT_PATH "
+                   f"to fall back to a throwaway project")
+            sys.exit(1)
+        project = resp.json()
+        record("Resolve persistent validation project", True,
+               f"id={project['id']} path={project['path_with_namespace']} (reusing existing project — "
+               f"issues/MRs/uploads/pipelines from this run will accumulate alongside prior runs)")
+        return project
+
     payload = {"name": TEST_PROJECT_NAME, "path": TEST_PROJECT_NAME, "initialize_with_readme": True}
     if NAMESPACE:
         ok, resp = req("GET", f"/namespaces/{NAMESPACE}")
@@ -153,6 +178,10 @@ def create_test_project():
 
 
 def delete_test_project(project_id):
+    if PERSISTENT_PROJECT_PATH:
+        print(f"      -> PERSISTENT_PROJECT_PATH set, leaving project id={project_id} in place "
+              f"(history accumulates across runs)")
+        return
     if KEEP_TEST_PROJECT:
         print(f"      -> KEEP_TEST_PROJECT=1 set, leaving project id={project_id} in place")
         return
@@ -190,6 +219,71 @@ def check_file_upload(project_id):
     ok, resp = req("POST", f"/projects/{project_id}/uploads", files=files, expect=(201,))
     record("Upload attachment (issue/MR upload API)", ok,
            f"HTTP {resp.status_code}" + (f", url={resp.json().get('url')}" if ok else f": {resp.text[:200]}"))
+
+
+def check_repo_directory_and_files(project_id, default_branch):
+    """
+    Creates an actual directory structure in the repo (not just a flat file
+    at root) with both a text file and a binary file, then reads both back
+    to confirm content survives the round trip intact. Covers a gap the
+    other checks miss: mr-test.txt and .gitlab-ci.yml are both single files
+    at repo root, and the /uploads API check only tests issue/MR
+    attachments, not actual repository file/directory handling.
+    """
+    branch = f"file-validation-{RUN_ID}"
+    ok, resp = req("POST", f"/projects/{project_id}/repository/branches",
+                    json={"branch": branch, "ref": default_branch}, expect=(201,))
+    record("Create branch for directory/file test", ok,
+           f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
+    if not ok:
+        return
+
+    text_content = f"Directory/file validation run {RUN_ID}\n"
+    # Same 1x1 transparent PNG as the upload check, reused here to also
+    # exercise binary content through the Commits API (base64 encoding).
+    png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+    dir_path = f"validation-dir-{RUN_ID}"
+    ok, resp = req("POST", f"/projects/{project_id}/repository/commits", json={
+        "branch": branch,
+        "commit_message": "add validation directory with text and binary files",
+        "actions": [
+            {"action": "create", "file_path": f"{dir_path}/subfolder/readme.txt", "content": text_content},
+            {"action": "create", "file_path": f"{dir_path}/subfolder/binary-test.png",
+             "content": png_b64, "encoding": "base64"},
+        ]
+    }, expect=(201,))
+    record("Create nested directory with text + binary files", ok,
+           f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else f"path={dir_path}/subfolder/")
+    if not ok:
+        return
+
+    # Confirm the directory actually shows up in the repo tree (not just
+    # that the commit API accepted the request).
+    ok, resp = req("GET", f"/projects/{project_id}/repository/tree",
+                    params={"path": f"{dir_path}/subfolder", "ref": branch})
+    found_names = [f["name"] for f in resp.json()] if ok else []
+    record("Directory listing shows both files", ok and set(found_names) == {"readme.txt", "binary-test.png"},
+           f"found: {found_names}" if ok else f"HTTP {resp.status_code}")
+
+    # Read the text file back and confirm content matches exactly.
+    ok, resp = req("GET", f"/projects/{project_id}/repository/files/"
+                           f"{quote(f'{dir_path}/subfolder/readme.txt', safe='')}/raw",
+                    params={"ref": branch})
+    record("Read back text file content matches", ok and resp.text == text_content,
+           "content matches" if ok and resp.text == text_content
+           else f"HTTP {resp.status_code}, got: {resp.text[:100]!r}" if ok else f"HTTP {resp.status_code}")
+
+    # Read the binary file back and confirm bytes match exactly (catches
+    # any post-upgrade regression in binary blob storage/retrieval, e.g. an
+    # object storage or Gitaly migration issue that only affects binaries).
+    ok, resp = req("GET", f"/projects/{project_id}/repository/files/"
+                           f"{quote(f'{dir_path}/subfolder/binary-test.png', safe='')}/raw",
+                    params={"ref": branch})
+    expected_bytes = base64.b64decode(png_b64)
+    record("Read back binary file content matches", ok and resp.content == expected_bytes,
+           "binary content matches byte-for-byte" if ok and resp.content == expected_bytes
+           else f"HTTP {resp.status_code}" if ok else f"HTTP {resp.status_code}")
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +412,7 @@ def check_merge_request(project_id, default_branch):
     ok, resp = req("POST", f"/projects/{project_id}/repository/commits", json={
         "branch": branch,
         "commit_message": "validation MR commit",
-        "actions": [{"action": "create", "file_path": "mr-test.txt", "content": "mr validation"}]
+        "actions": [{"action": "create", "file_path": f"mr-test-{RUN_ID}.txt", "content": "mr validation"}]
     }, expect=(201,))
     record("Commit via Commits API", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
     if not ok:
@@ -371,6 +465,11 @@ def check_pipeline(project_id, project, default_branch, runner_tag=None):
     # make this check fail on a permissions/policy issue unrelated to the
     # upgrade. Pipelines can be triggered against any branch, so this avoids
     # needing elevated permissions just to run a CI smoke test.
+    #
+    # This branch is never merged back, so overwriting .gitlab-ci.yml here
+    # never touches the project's real CI config on its default branch —
+    # important when reusing an existing project (e.g. PERSISTENT_PROJECT_PATH
+    # pointed at a project that already has its own .gitlab-ci.yml).
     ci_yaml = build_ci_yaml(runner_tag)
     ci_branch = f"ci-validation-{RUN_ID}"
     ok, resp = req("POST", f"/projects/{project_id}/repository/branches",
@@ -379,15 +478,23 @@ def check_pipeline(project_id, project, default_branch, runner_tag=None):
     if not ok:
         return
 
+    # The branch was just cut from default_branch, so if that branch already
+    # has a .gitlab-ci.yml (common when reusing an existing project), the
+    # Commits API's "create" action will reject it — the file already
+    # exists in this branch's history. Detect that and use "update" instead.
+    existing_ok, _ = req("GET", f"/projects/{project_id}/repository/files/.gitlab-ci.yml",
+                          params={"ref": ci_branch}, expect=(200,))
+    commit_action = "update" if existing_ok else "create"
+
     ok, resp = req("POST", f"/projects/{project_id}/repository/commits", json={
         "branch": ci_branch,
         "commit_message": "add validation ci config",
-        "actions": [{"action": "create", "file_path": ".gitlab-ci.yml", "content": ci_yaml}]
+        "actions": [{"action": commit_action, "file_path": ".gitlab-ci.yml", "content": ci_yaml}]
     }, expect=(201,))
-    record("Push .gitlab-ci.yml" + (f" (tagged: {runner_tag})" if runner_tag else " (untagged)"),
+    record("Push .gitlab-ci.yml" + (f" (tagged: {runner_tag})" if runner_tag else " (untagged)")
+           + f" [{commit_action}]",
            ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
     if not ok:
-
         return
 
     ok, resp = req("GET", f"/projects/{project_id}/pipelines?ref={ci_branch}&order_by=id&sort=desc&per_page=1")
@@ -584,12 +691,18 @@ def check_webhook(project_id):
         return
     hook_id = resp.json()["id"]
 
-    if not WEBHOOK_TEST_URL:
-        return  # trigger check skipped — set WEBHOOK_TEST_URL to an internally-reachable
-                # endpoint to also validate webhook delivery, not just creation
+    if WEBHOOK_TEST_URL:
+        ok, resp = req("POST", f"/projects/{project_id}/hooks/{hook_id}/test/push_events", expect=(201, 200))
+        record("Trigger webhook test event", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
+    # else: trigger check skipped — set WEBHOOK_TEST_URL to an internally-reachable
+    # endpoint to also validate webhook delivery, not just creation
 
-    ok, resp = req("POST", f"/projects/{project_id}/hooks/{hook_id}/test/push_events", expect=(201, 200))
-    record("Trigger webhook test event", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
+    # Always clean up the webhook itself — even in persistent-project mode,
+    # a growing pile of test webhooks pointing at dummy/dead targets has no
+    # evidentiary value and is just clutter (unlike issues/MRs/pipelines,
+    # which are meaningful history).
+    ok, resp = req("DELETE", f"/projects/{project_id}/hooks/{hook_id}", expect=(204,))
+    record("Cleanup: delete webhook", ok, f"HTTP {resp.status_code}")
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +717,17 @@ def check_access_tokens(project_id):
         "expires_at": (datetime.now(timezone.utc).date().isoformat())
     }, expect=(201,))
     record("Create project access token", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
+    if not ok:
+        return
+
+    # Always revoke immediately after proving it can be created — a live
+    # credential (even a short-lived, read_api-scoped one) has no reason to
+    # persist past the check that proves token creation works, regardless
+    # of whether the surrounding project is throwaway or persistent.
+    token_id = resp.json().get("id")
+    if token_id:
+        ok, resp = req("DELETE", f"/projects/{project_id}/access_tokens/{token_id}", expect=(204,))
+        record("Revoke project access token", ok, f"HTTP {resp.status_code}")
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +748,7 @@ def main():
     try:
         check_issue_lifecycle(project_id)
         check_file_upload(project_id)
+        check_repo_directory_and_files(project_id, default_branch)
         check_git_ops(project)
         check_merge_request(project_id, default_branch)
         check_job_token_scope(project_id)
