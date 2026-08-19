@@ -486,10 +486,36 @@ def check_runners():
         print("      -> no online runners found — pipeline check will likely stay pending")
         return None, None, None
 
-    # Prefer a tagged runner (routing is explicit and predictable).
-    online_with_tags = [r for r in online if r.get("tag_list")]
-    chosen = online_with_tags[0] if online_with_tags else online[0]
-    tag = chosen["tag_list"][0] if chosen.get("tag_list") else None
+    # The /runners/all LIST endpoint's tag_list can be stale/incomplete —
+    # confirmed by real-world evidence: a manually tagged 'uat' job runs
+    # successfully on a runner the list endpoint reports as tags=[]. Query
+    # each online runner's own detail endpoint (authoritative) rather than
+    # trusting the list response, and prefer whichever one turns out to
+    # actually have tags configured.
+    detailed = []
+    for r in online:
+        ok_detail, resp_detail = req("GET", f"/runners/{r['id']}")
+        if ok_detail:
+            d = resp_detail.json()
+            print(f"      -> runner {r['id']} ('{r.get('description')}') detail: "
+                  f"tag_list={d.get('tag_list', [])}, run_untagged={d.get('run_untagged')}, "
+                  f"locked={d.get('locked')}, access_level={d.get('access_level')}")
+            detailed.append((r, d))
+        else:
+            detailed.append((r, {}))
+
+    tagged = [(r, d) for r, d in detailed if d.get("tag_list")]
+    if tagged:
+        chosen, chosen_detail = tagged[0]
+        tag = chosen_detail["tag_list"][0]
+    else:
+        chosen, chosen_detail = detailed[0]
+        tag = None
+        if chosen_detail.get("run_untagged") is False:
+            print(f"      -> WARNING: chosen runner has no tags AND run_untagged=False — "
+                  f"it will NEVER pick up an untagged job. Either tag the validation job to "
+                  f"match a real tag on a runner, or enable 'Run untagged jobs' on it.")
+
     runner_type = chosen.get("runner_type")
     print(f"      -> will attempt to use runner '{chosen.get('description')}' "
           f"(id={chosen['id']}, type={runner_type}"
