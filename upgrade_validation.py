@@ -96,9 +96,18 @@ def req(method, path, expect=(200, 201, 202, 204), **kwargs):
 # 1. Instance health
 # ---------------------------------------------------------------------------
 def check_health_endpoints():
+    # NOTE: These are informational only, not pass/fail-gating. They're
+    # unauthenticated and, by default, IP-allowlisted (monitoring_whitelist
+    # in gitlab.rb) — a 404 from an arbitrary client is expected and doesn't
+    # indicate the instance is unhealthy. The authenticated /api/v4/user and
+    # /api/v4/version calls elsewhere are the real reachability/health gate.
     for ep in ["/-/liveness", "/-/readiness", "/-/health"]:
-        ok, resp = req("GET", f"{GITLAB_URL}{ep}", expect=(200,))
-        record(f"Health endpoint {ep}", ok, f"HTTP {resp.status_code}: {resp.text[:200]}")
+        try:
+            ok, resp = req("GET", f"{GITLAB_URL}{ep}", expect=(200,))
+            status = "reachable (200)" if ok else f"HTTP {resp.status_code} (likely IP-allowlisted, not necessarily unhealthy)"
+        except requests.RequestException as e:
+            status = f"request error: {e}"
+        print(f"[INFO] Health endpoint {ep} — {status}")
 
 
 def check_version():
@@ -205,29 +214,67 @@ def check_git_https(project):
     auth_url = f"{proto}://oauth2:{TOKEN}@{rest}"
 
     tmpdir = tempfile.mkdtemp(prefix="gl-validate-")
-    try:
-        r = subprocess.run(["git", "clone", "--quiet", auth_url, tmpdir],
-                            capture_output=True, text=True, timeout=60)
-        record("Git clone (HTTPS)", r.returncode == 0, r.stderr.strip()[:300])
+    # Use a shorter timeout with git's own connect-timeout so a bad/unreachable
+    # clone URL fails fast with a clear message instead of hanging until the
+    # outer subprocess timeout kills it.
+    git_env = os.environ.copy()
+    git_env["GIT_TERMINAL_PROMPT"] = "0"  # never hang waiting for interactive credential prompt
+    git_ssl_opts = [] if VERIFY_TLS else ["-c", "http.sslVerify=false"]
 
+    try:
+        r = subprocess.run(
+            ["git"] + git_ssl_opts + ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=15",
+             "clone", "--quiet", "--depth", "1", auth_url, tmpdir],
+            capture_output=True, text=True, timeout=30, env=git_env,
+        )
+        clone_ok = r.returncode == 0
+        record("Git clone (HTTPS)", clone_ok,
+               (r.stderr.strip()[:300] if not clone_ok else
+                f"cloned from {clone_url} (if this URL isn't reachable from where you're running "
+                f"this script, check external_url in gitlab.rb matches how you access the instance)"))
+        if not clone_ok:
+            record("Git commit", False, "skipped — clone failed")
+            record("Git push (HTTPS)", False, "skipped — clone failed")
+            record("Git pull (HTTPS)", False, "skipped — clone failed")
+            return
+    except subprocess.TimeoutExpired:
+        record("Git clone (HTTPS)", False,
+               f"TIMED OUT after 30s cloning {clone_url} — this usually means the clone URL GitLab "
+               f"returned isn't actually reachable from here (check external_url in gitlab.rb vs. "
+               f"the URL/proxy path you're using to reach the instance), not a credential problem")
+        record("Git commit", False, "skipped — clone timed out")
+        record("Git push (HTTPS)", False, "skipped — clone timed out")
+        record("Git pull (HTTPS)", False, "skipped — clone timed out")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+    except Exception as e:
+        record("Git clone (HTTPS)", False, f"unexpected error: {e}")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
+    try:
         test_file = os.path.join(tmpdir, "validation-file.txt")
         with open(test_file, "w") as f:
             f.write(f"validation run {RUN_ID}\n")
 
-        subprocess.run(["git", "-C", tmpdir, "config", "user.email", "validation@local"], check=True)
-        subprocess.run(["git", "-C", tmpdir, "config", "user.name", "Upgrade Validation"], check=True)
-        subprocess.run(["git", "-C", tmpdir, "add", "."], check=True)
+        subprocess.run(["git", "-C", tmpdir, "config", "user.email", "validation@local"], check=True, timeout=10)
+        subprocess.run(["git", "-C", tmpdir, "config", "user.name", "Upgrade Validation"], check=True, timeout=10)
+        subprocess.run(["git", "-C", tmpdir, "add", "."], check=True, timeout=10)
         r = subprocess.run(["git", "-C", tmpdir, "commit", "-m", "validation commit"],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, timeout=10)
         record("Git commit", r.returncode == 0, r.stderr.strip()[:300])
 
-        r = subprocess.run(["git", "-C", tmpdir, "push", "origin", "HEAD"],
-                            capture_output=True, text=True, timeout=60)
+        r = subprocess.run(["git"] + git_ssl_opts + ["-C", tmpdir, "push", "origin", "HEAD"],
+                            capture_output=True, text=True, timeout=30, env=git_env)
         record("Git push (HTTPS)", r.returncode == 0, (r.stderr or r.stdout).strip()[:400])
 
-        r = subprocess.run(["git", "-C", tmpdir, "pull", "--quiet"],
-                            capture_output=True, text=True, timeout=60)
+        r = subprocess.run(["git"] + git_ssl_opts + ["-C", tmpdir, "pull", "--quiet"],
+                            capture_output=True, text=True, timeout=30, env=git_env)
         record("Git pull (HTTPS)", r.returncode == 0, r.stderr.strip()[:300])
+    except subprocess.TimeoutExpired as e:
+        record(f"Git operation ({' '.join(e.cmd[:3])}...)", False, "timed out")
+    except Exception as e:
+        record("Git commit/push/pull", False, f"unexpected error: {e}")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -356,13 +403,23 @@ def check_runners():
         return
     runners = resp.json()
     record("List runners", True, f"{len(runners)} runner(s) visible")
-    online = [r for r in runners if r.get("status") == "online" or r.get("active")]
-    offline = [r for r in runners if r not in online]
-    record("At least one runner online", len(online) > 0,
-           f"online={len(online)} offline/stale={len(offline)}")
+
+    paused = [r for r in runners if r.get("paused") or r.get("status") == "paused"]
+    online = [r for r in runners if r.get("status") == "online"]
+    offline_or_stale = [r for r in runners
+                         if r not in online and r not in paused]
+
+    if paused and not online:
+        record("At least one runner online", False,
+               f"{len(paused)} runner(s) are administratively PAUSED (not a connectivity issue — "
+               f"unpause under Admin Area > CI/CD > Runners, or a project's Settings > CI/CD > Runners)")
+    else:
+        record("At least one runner online", len(online) > 0,
+               f"online={len(online)} paused={len(paused)} offline/stale={len(offline_or_stale)}")
+
     for r in runners:
         print(f"      -> runner '{r.get('description')}' id={r.get('id')} "
-              f"status={r.get('status', 'n/a')} tags={r.get('tag_list', [])}")
+              f"status={r.get('status', 'n/a')} paused={r.get('paused', 'n/a')} tags={r.get('tag_list', [])}")
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +460,8 @@ def check_access_tokens(project_id):
 # ---------------------------------------------------------------------------
 def check_glab_cli():
     if shutil.which("glab") is None:
-        record("glab CLI installed", False, "glab not found on PATH — skip or install to test CLI workflows")
+        print("[SKIP] glab CLI not found on PATH — optional, skipping CLI checks "
+              "(install glab separately to also validate CLI workflows)")
         return
     r = subprocess.run(["glab", "--version"], capture_output=True, text=True)
     record("glab --version", r.returncode == 0, r.stdout.strip())
@@ -467,4 +525,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"\n!!! Unexpected error: {e}")
+        traceback.print_exc()
+        # Still write whatever we captured before the crash so nothing is lost
+        report_path = f"gitlab_validation_report_{RUN_ID}_partial.json"
+        with open(report_path, "w") as f:
+            json.dump([{"check": n, "passed": ok, "detail": d} for n, ok, d in results], f, indent=2)
+        print(f"Partial report (results collected before the crash) written to {report_path}")
+        sys.exit(2)
