@@ -249,25 +249,30 @@ def check_git_ops(project):
 
     protocol_used = None
     clone_url = None
-    git_env = os.environ.copy()
-    git_env["GIT_TERMINAL_PROMPT"] = "0"
 
     attempts = []
     if GIT_PROTOCOL_PREF in ("auto", "https"):
-        attempts.append(("https", https_auth_url, git_env))
+        attempts.append(("https", https_auth_url, os.environ.copy()))
     if GIT_PROTOCOL_PREF in ("auto", "ssh") and ssh_url:
         attempts.append(("ssh", ssh_url, _git_env_for_ssh()))
 
-    tmpdir = tempfile.mkdtemp(prefix="gl-validate-")
+    tmpdir = None
     last_detail = ""
     try:
         for proto_name, url, env in attempts:
-            ok, detail = _try_git_clone(url, tmpdir, env, timeout=30)
+            env.setdefault("GIT_TERMINAL_PROMPT", "0")
+            # Fresh directory per attempt — a prior timed-out/partial clone
+            # leaves a non-empty dir that would otherwise break the next
+            # protocol's clone attempt with a misleading "already exists" error.
+            attempt_dir = tempfile.mkdtemp(prefix="gl-validate-")
+            ok, detail = _try_git_clone(url, attempt_dir, env, timeout=30)
             if ok:
                 protocol_used = proto_name
                 clone_url = url
+                tmpdir = attempt_dir
                 break
             last_detail = f"[{proto_name}] {detail}"
+            shutil.rmtree(attempt_dir, ignore_errors=True)
             print(f"      -> {proto_name} clone failed ({detail}), "
                   f"{'trying next protocol...' if GIT_PROTOCOL_PREF == 'auto' else 'not retrying (protocol forced)'}")
 
@@ -287,7 +292,8 @@ def check_git_ops(project):
         with open(test_file, "w") as f:
             f.write(f"validation run {RUN_ID}\n")
 
-        env = _git_env_for_ssh() if protocol_used == "ssh" else git_env
+        env = _git_env_for_ssh() if protocol_used == "ssh" else os.environ.copy()
+        env.setdefault("GIT_TERMINAL_PROMPT", "0")
         ssl_opts = [] if VERIFY_TLS else ["-c", "http.sslVerify=false"]
 
         subprocess.run(["git", "-C", tmpdir, "config", "user.email", "validation@local"], check=True, timeout=10)
@@ -309,7 +315,8 @@ def check_git_ops(project):
     except Exception as e:
         record("Git commit/push/pull", False, f"unexpected error: {e}")
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -371,8 +378,21 @@ validation_job:
 
 
 def check_pipeline(project_id, project, default_branch):
+    # Push to a dedicated feature branch, not the default branch directly —
+    # default branches are commonly protected (only Maintainer+ can push, or
+    # push is blocked entirely in favor of MR-only workflows), which would
+    # make this check fail on a permissions/policy issue unrelated to the
+    # upgrade. Pipelines can be triggered against any branch, so this avoids
+    # needing elevated permissions just to run a CI smoke test.
+    ci_branch = f"ci-validation-{RUN_ID}"
+    ok, resp = req("POST", f"/projects/{project_id}/repository/branches",
+                    json={"branch": ci_branch, "ref": default_branch}, expect=(201,))
+    record("Create CI validation branch", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
+    if not ok:
+        return
+
     ok, resp = req("POST", f"/projects/{project_id}/repository/commits", json={
-        "branch": default_branch,
+        "branch": ci_branch,
         "commit_message": "add validation ci config",
         "actions": [{"action": "create", "file_path": ".gitlab-ci.yml", "content": CI_YAML}]
     }, expect=(201,))
@@ -380,13 +400,13 @@ def check_pipeline(project_id, project, default_branch):
     if not ok:
         return
 
-    ok, resp = req("GET", f"/projects/{project_id}/pipelines?order_by=id&sort=desc&per_page=1")
+    ok, resp = req("GET", f"/projects/{project_id}/pipelines?ref={ci_branch}&order_by=id&sort=desc&per_page=1")
     if not ok or not resp.json():
         record("Pipeline created after push", False, "No pipeline found — check runner/webhook config")
         return
     pipeline = resp.json()[0]
     pipeline_id = pipeline["id"]
-    record("Pipeline triggered on push", True, f"pipeline id={pipeline_id}")
+    record("Pipeline triggered on push", True, f"pipeline id={pipeline_id} branch={ci_branch}")
 
     # Poll for completion (runner must be available and tagged correctly)
     deadline = time.time() + 180
