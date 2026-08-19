@@ -64,7 +64,9 @@ VERIFY_TLS = os.environ.get("GITLAB_VERIFY_TLS", "1") != "0"
 TIMEOUT = 30
 SSH_PRIVATE_KEY_PATH = os.environ.get("GIT_SSH_PRIVATE_KEY_PATH", "")
 GIT_PROTOCOL_PREF = os.environ.get("GIT_TEST_PROTOCOL", "auto")  # auto | https | ssh
-WEBHOOK_TEST_URL = os.environ.get("WEBHOOK_TEST_URL", "https://httpbin.org/post")
+WEBHOOK_TEST_URL = os.environ.get("WEBHOOK_TEST_URL", "")  # empty = skip the trigger-event
+                                                             # check entirely (still tests
+                                                             # webhook CREATE via the API)
 
 if not GITLAB_URL or not TOKEN:
     print("ERROR: set GITLAB_URL and GITLAB_TOKEN environment variables.")
@@ -93,24 +95,6 @@ def req(method, path, expect=(200, 201, 202, 204), **kwargs):
     resp = requests.request(method, url, **kwargs)
     ok = resp.status_code in expect
     return ok, resp
-
-
-# ---------------------------------------------------------------------------
-# 1. Instance health
-# ---------------------------------------------------------------------------
-def check_health_endpoints():
-    # NOTE: These are informational only, not pass/fail-gating. They're
-    # unauthenticated and, by default, IP-allowlisted (monitoring_whitelist
-    # in gitlab.rb) — a 404 from an arbitrary client is expected and doesn't
-    # indicate the instance is unhealthy. The authenticated /api/v4/user and
-    # /api/v4/version calls elsewhere are the real reachability/health gate.
-    for ep in ["/-/liveness", "/-/readiness", "/-/health"]:
-        try:
-            ok, resp = req("GET", f"{GITLAB_URL}{ep}", expect=(200,))
-            status = "reachable (200)" if ok else f"HTTP {resp.status_code} (likely IP-allowlisted, not necessarily unhealthy)"
-        except requests.RequestException as e:
-            status = f"request error: {e}"
-        print(f"[INFO] Health endpoint {ep} — {status}")
 
 
 def check_version():
@@ -583,8 +567,13 @@ def ensure_project_runner_access(project_id, runner_id, runner_type):
 # 9. Webhooks
 # ---------------------------------------------------------------------------
 def check_webhook(project_id):
+    # If WEBHOOK_TEST_URL isn't set, only test that webhook CREATE works via
+    # the API — skip the trigger-event step entirely rather than pointing it
+    # at an external default (like httpbin.org) that most locked-down
+    # instances will correctly SSRF-block, which just produces noise.
+    target_url = WEBHOOK_TEST_URL or "https://example.invalid/webhook-target-not-configured"
     ok, resp = req("POST", f"/projects/{project_id}/hooks", json={
-        "url": WEBHOOK_TEST_URL,
+        "url": target_url,
         "push_events": True,
         "issues_events": True,
         "enable_ssl_verification": True
@@ -594,14 +583,12 @@ def check_webhook(project_id):
         return
     hook_id = resp.json()["id"]
 
+    if not WEBHOOK_TEST_URL:
+        return  # trigger check skipped — set WEBHOOK_TEST_URL to an internally-reachable
+                # endpoint to also validate webhook delivery, not just creation
+
     ok, resp = req("POST", f"/projects/{project_id}/hooks/{hook_id}/test/push_events", expect=(201, 200))
-    if not ok and resp.status_code == 422 and "blocked" in resp.text.lower():
-        print(f"[INFO] Webhook test target ({WEBHOOK_TEST_URL}) blocked by outbound URL allowlist "
-              f"(SSRF protection) — this is likely a network policy working as intended, not an "
-              f"upgrade regression. Set WEBHOOK_TEST_URL to an internally-reachable endpoint to get "
-              f"a real pass/fail signal.")
-    else:
-        record("Trigger webhook test event", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
+    record("Trigger webhook test event", ok, f"HTTP {resp.status_code}: {resp.text[:200]}" if not ok else "")
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +632,6 @@ def check_glab_cli():
 def main():
     print(f"=== GitLab Upgrade Validation — target: {GITLAB_URL} ===\n")
 
-    check_health_endpoints()
     check_version()
     check_auth()
     check_personal_access_tokens()
