@@ -61,6 +61,7 @@ NAMESPACE = os.environ.get("GITLAB_NAMESPACE", "")
 EXPECTED_VERSION = os.environ.get("EXPECTED_VERSION", "")
 KEEP_TEST_PROJECT = os.environ.get("KEEP_TEST_PROJECT", "0") == "1"
 VERIFY_TLS = os.environ.get("GITLAB_VERIFY_TLS", "1") != "0"
+TIMEOUT = 30
 SSH_PRIVATE_KEY_PATH = os.environ.get("GIT_SSH_PRIVATE_KEY_PATH", "")
 GIT_PROTOCOL_PREF = os.environ.get("GIT_TEST_PROTOCOL", "auto")  # auto | https | ssh
 WEBHOOK_TEST_URL = os.environ.get("WEBHOOK_TEST_URL", "https://httpbin.org/post")
