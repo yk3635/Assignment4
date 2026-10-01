@@ -5,7 +5,7 @@
 **Config location:** `/etc/haproxy/haproxy.cfg` (+ any included files under `/etc/haproxy/conf.d/` if split)
 **SSL cert location (RHEL default):** `/etc/pki/tls/certs/` and `/etc/pki/tls/private/` (or `/etc/haproxy/certs/` if using combined PEM files — check your `bind` line)
 **Service manager:** `systemctl` (unit: `haproxy.service`)
-**Stats/admin socket (if enabled):** typically `/run/haproxy/admin.sock` or `/var/lib/haproxy/stats`
+**Stats/admin socket:** `/var/lib/haproxy/stats` (confirmed via `grep -i "stats socket" /etc/haproxy/haproxy.cfg`)
 
 ---
 
@@ -26,11 +26,17 @@ journalctl -u haproxy -n 50 --no-pager
 tail -n 100 /var/log/haproxy.log 2>/dev/null || journalctl -u haproxy --since "10 min ago"
 
 # 5. Are backends healthy from HAProxy's own point of view?
-echo "show stat" | socat stdio /run/haproxy/admin.sock 2>/dev/null | cut -d',' -f1,2,18
+echo "show stat" | socat stdio /var/lib/haproxy/stats 2>/dev/null | cut -d',' -f1,2,18
 # (field 18 = check status; look for UP/DOWN per server)
 ```
 
 Note: HAProxy commonly logs to syslog/journal rather than a dedicated file unless you've configured `log` explicitly in the `global` section — check `grep -A2 "^global" /etc/haproxy/haproxy.cfg | grep log` if step 4 comes up empty.
+
+**If `/var/lib/haproxy/stats` doesn't exist on a box you're troubleshooting:** don't assume it's dead — confirm the actual configured path first, since it varies by host/config:
+```bash
+grep -i "stats socket" /etc/haproxy/haproxy.cfg
+```
+If that returns nothing at all, no admin socket is enabled on that host — fall back to the HTTP stats page (if a `listen stats` block exists) or `journalctl -u haproxy | grep -iE "Server .* (DOWN|UP)"` for recent transitions only. See Section 6 for the full fallback chain.
 
 ---
 
@@ -160,11 +166,18 @@ firewall-cmd --list-ports
 **Likely causes:** backend app down, health check misconfigured/too strict, backend unreachable due to network/firewall, all servers in a backend marked DOWN.
 
 ```bash
-# Live view of backend server health (requires stats socket enabled)
-echo "show stat" | socat stdio /run/haproxy/admin.sock | cut -d',' -f1,2,18,36,37
+# Live view of backend server health via the stats socket
+echo "show stat" | socat stdio /var/lib/haproxy/stats | cut -d',' -f1,2,18,36,37
 
-# Or via the stats HTTP page if enabled:
-curl -s http://localhost:<stats_port>/stats | grep -A2 "DOWN"
+# If the socket path differs on the box you're on, confirm it first:
+#   grep -i "stats socket" /etc/haproxy/haproxy.cfg
+
+# Fallback 1 — stats HTTP page if a `listen stats` block is configured:
+curl -s "http://localhost:<stats_port>/stats;csv" | cut -d',' -f1,2,18
+
+# Fallback 2 — no socket and no stats page: only shows DOWN/UP *transitions*,
+# not current steady-state, but works with zero config access mid-incident:
+journalctl -u haproxy --since "1 hour ago" | grep -iE "Server .* (DOWN|UP)"
 
 # Check what health check HAProxy is actually running
 grep -A5 "^backend" /etc/haproxy/haproxy.cfg | grep -E "option httpchk|check"
@@ -176,7 +189,7 @@ curl -v http://<backend_ip>:<port>/<healthcheck_path>
 journalctl -u haproxy --since "1 hour ago" | grep -i "DOWN\|UP\|Server"
 
 # Manually force a server back into rotation if it's flapping and you've confirmed it's healthy
-echo "enable server <backend_name>/<server_name>" | socat stdio /run/haproxy/admin.sock
+echo "enable server <backend_name>/<server_name>" | socat stdio /var/lib/haproxy/stats
 ```
 
 **If a backend is genuinely down:** this becomes that application's issue (Jenkins, GitLab, whatever's behind it) — hand off, but keep the `show stat` output and timestamps as evidence.
@@ -244,10 +257,10 @@ Config/version drift between DCs is itself often the root cause of "works in one
 
 ```bash
 # Current connection counts vs configured limits
-echo "show info" | socat stdio /run/haproxy/admin.sock | grep -E "CurrConns|MaxConn|Maxsock"
+echo "show info" | socat stdio /var/lib/haproxy/stats | grep -E "CurrConns|MaxConn|Maxsock"
 
 # Per-backend queueing (a growing Qcur means requests are backing up waiting for a server slot)
-echo "show stat" | socat stdio /run/haproxy/admin.sock | cut -d',' -f1,2,3,4
+echo "show stat" | socat stdio /var/lib/haproxy/stats | cut -d',' -f1,2,3,4
 
 # System-level connection tracking
 ss -s
@@ -277,8 +290,9 @@ systemctl restart haproxy                          # hard restart
 haproxy -c -f /etc/haproxy/haproxy.cfg             # validate config
 journalctl -u haproxy -n 100 --no-pager            # recent service logs
 ss -tlnp | grep haproxy                            # confirm listening ports
-echo "show stat" | socat stdio /run/haproxy/admin.sock   # live backend health
-echo "show info" | socat stdio /run/haproxy/admin.sock   # runtime stats/limits
+echo "show stat" | socat stdio /var/lib/haproxy/stats   # live backend health
+echo "show info" | socat stdio /var/lib/haproxy/stats   # runtime stats/limits
+grep -i "stats socket" /etc/haproxy/haproxy.cfg          # confirm actual socket path on a given host
 curl -kv https://localhost/<path> -H "Host: server.example.com"   # local test bypassing DNS
 openssl x509 -in <cert> -noout -dates              # cert expiry check
 ```
